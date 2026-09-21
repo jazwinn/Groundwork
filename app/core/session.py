@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 from typing import Callable, Iterable
@@ -80,6 +81,26 @@ def _adopt_legacy_session() -> None:
         pass
 
 
+# Windows refuses to rename onto a file that somebody else still has open, and
+# on a machine where the project folder is synced or virus-scanned "somebody
+# else" is routine — the save fails with a sharing violation through no fault
+# of ours.  The other handle is held for a moment rather than a minute, so a
+# few quick retries turn a failed save into a very slightly slower one.
+_REPLACE_ATTEMPTS = 12
+_REPLACE_PAUSE = 0.05
+
+
+def _replace_atomically(tmp: str, path: str) -> None:
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_PAUSE)
+
+
 def _locate_frame(image_path: str) -> str | None:
     """Find a frame whose recorded path no longer resolves.
 
@@ -109,6 +130,7 @@ class Session:
         self._emit = emit
         self.jobs = JobManager()
         self._lock = threading.RLock()
+        self._save_lock = threading.Lock()   # one writer at a time in save_state
 
         # Loaded models are cached for the life of the process
         self._sam_model = None
@@ -176,26 +198,68 @@ class Session:
         self._dirty = True
 
     def save_state(self, path: str | None = None) -> str:
+        """Write the session out, atomically, one writer at a time.
+
+        Every save used to go through a single "session.json.tmp", and saves
+        come from two places at once: the autosave thread, and whichever
+        request thread just changed something.  Overlap them and one is still
+        writing the temp file when the other renames it away — on Windows that
+        is a PermissionError out of `os.replace`, which surfaced as a 500 on a
+        request whose edit had *already* been applied in memory.  Serialising
+        the whole save (snapshot included, so the newest one lands last) is
+        what actually fixes that; the per-save temp name keeps two processes
+        pointed at the same session folder from colliding the same way.
+        """
         path = path or STATE_FILE
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with self._lock:
-            data = {
-                "version": 2,
-                "saved_at": time.time(),
-                "class_names": self.class_names,
-                "task": self.task,
-                "sam_model_key": self.sam_model_key,
-                "threshold": self.threshold,
-                "mask_detail": self.mask_detail,
-                "video_stride": self.video_stride,
-                "frames": [ann.to_dict() for ann in self.store.values()],
-            }
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(data, fh)
-        os.replace(tmp, path)
-        self._dirty = False
+        with self._save_lock:
+            with self._lock:
+                data = {
+                    "version": 2,
+                    "saved_at": time.time(),
+                    "class_names": self.class_names,
+                    "task": self.task,
+                    "sam_model_key": self.sam_model_key,
+                    "threshold": self.threshold,
+                    "mask_detail": self.mask_detail,
+                    "video_stride": self.video_stride,
+                    "frames": [ann.to_dict() for ann in self.store.values()],
+                }
+                # Cleared against the snapshot, not after the write: anything
+                # changed while this save is in flight re-dirties the session
+                # and goes out with the next one instead of being marked saved.
+                self._dirty = False
+            tmp = f"{path}.{os.getpid()}.{threading.get_ident():x}.tmp"
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(data, fh)
+                _replace_atomically(tmp, path)
+            except BaseException:
+                # Nothing reached session.json, so the session is still unsaved.
+                self._dirty = True
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
         return path
+
+    def flush_state(self, what: str = "") -> bool:
+        """Save now if we can, and say so rather than throw if we cannot.
+
+        For the callers that have *already* applied their change in memory.
+        The change is not lost when this returns False — it is still in the
+        store, still dirty, and the autosave thread will try again.
+        """
+        try:
+            self.save_state()
+            return True
+        except Exception as exc:
+            print(f"Could not save the session: {exc}", file=sys.stderr)
+            self.toast(f"{what + ': ' if what else ''}the change was applied but "
+                       f"could not be saved just now — retrying in the background.",
+                       "warn")
+            return False
 
     def load_state(self, path: str | None = None) -> int:
         if path is None:
@@ -390,7 +454,13 @@ class Session:
                 self.set_boxes(index, merged, status=ann.status)
 
         if removed:
-            self.save_state()
+            # The boxes are already folded away in the store, and set_boxes has
+            # marked the session dirty, so a save that fails here is "not on
+            # disk yet" and not "not merged" — autosave comes back for it.
+            # Raising would tell the caller the merge did not happen, which is
+            # the one thing that is definitely untrue by this point, and would
+            # leave the UI showing boxes that no longer exist.
+            self.flush_state("Merge overlapping")
         return {"frames": changed, "removed": removed, "scanned": len(targets)}
 
     # ──────────────────────────────────────────────────────────────
@@ -627,9 +697,13 @@ class Session:
                     source_image="" if video else source_path,
                 )
                 self._read_size(ann)
-                self.store[index] = ann
-                if video:
-                    self.video_stride.setdefault(source_path, stride)
+                # Under the lock like every other change to the store: an
+                # import runs on a job thread while requests are still being
+                # served, and a reader walking the store wants it to hold still.
+                with self._lock:
+                    self.store[index] = ann
+                    if video:
+                        self.video_stride.setdefault(source_path, stride)
                 pending.append(self.frame_meta(ann))
                 # Batch UI updates: a 10k-frame video should not mean 10k messages
                 if len(pending) >= 24 or (time.time() - last_flush[0]) > 0.4:
@@ -1032,26 +1106,37 @@ class Session:
     # ──────────────────────────────────────────────────────────────
 
     def stats(self) -> dict:
-        total = len(self.store)
-        labelled = sum(1 for a in self.store.values() if a.boxes)
-        boxes = sum(len(a.boxes) for a in self.store.values())
+        """Counts for the sidebar.
+
+        Everything is counted off one snapshot taken under the lock, because an
+        import adds frames from a job thread while requests are being served.
+        Every walk added here wants to read `frames` for the same reason — a
+        fresh `self.store.values()` slipped in below is another chance to be
+        halfway through the store when it changes size.
+        """
+        with self._lock:
+            frames = list(self.store.values())
+            class_names = list(self.class_names)
+        total = len(frames)
+        labelled = sum(1 for a in frames if a.boxes)
+        boxes = sum(len(a.boxes) for a in frames)
         per_class: dict[str, int] = {}
-        for ann in self.store.values():
+        for ann in frames:
             for box in ann.boxes:
-                name = (self.class_names[box.class_id]
-                        if 0 <= box.class_id < len(self.class_names)
+                name = (class_names[box.class_id]
+                        if 0 <= box.class_id < len(class_names)
                         else f"class {box.class_id}")
                 per_class[name] = per_class.get(name, 0) + 1
         return {
             "frames": total,
-            "heldOut": sum(1 for a in self.store.values() if a.held_out),
-            "exported": sum(1 for a in self.store.values() if a.exported),
+            "heldOut": sum(1 for a in frames if a.held_out),
+            "exported": sum(1 for a in frames if a.exported),
             "labelled": labelled,
             "unlabelled": total - labelled,
             "boxes": boxes,
             "perClass": per_class,
             "videos": sorted({os.path.basename(a.source_video)
-                              for a in self.store.values() if a.source_video}),
+                              for a in frames if a.source_video}),
         }
 
 
