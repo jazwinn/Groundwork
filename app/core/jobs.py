@@ -190,6 +190,12 @@ class JobManager:
                 if job.is_cancelled:
                     job.status = CANCELLED
                     job.message = "Stopped"
+                    # A target that returns after being asked to stop has kept
+                    # everything it reached — a script writes its frames before
+                    # handing the report back.  Throwing that report away left
+                    # the labels changed and nothing to say what changed, which
+                    # reads as Stop having done nothing at all.
+                    job.result = result or {}
                 else:
                     job.status = DONE
                     job.result = result or {}

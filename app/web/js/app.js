@@ -701,21 +701,26 @@ function onJobFinished(job) {
     toast(job.error || 'Something went wrong.', 'error', job.label);
     return;
   }
-  if (job.status === 'cancelled') {
+  const r = job.result || {};
+  const stopped = job.status === 'cancelled';
+  // Stopping does not undo: a run keeps every frame it reached, and one that
+  // returned rather than raised handed back a report of exactly that.  Only
+  // fall back to the bare message when there is genuinely nothing to show.
+  if (stopped && !Object.keys(r).length) {
     toast('Stopped. Everything finished so far is kept.', 'warn', job.label);
     return;
   }
-  const r = job.result || {};
+  const title = (done) => (stopped ? 'Stopped' : done);
   if (job.kind === 'import') {
-    toast(`${plural(r.frames ?? 0, 'frame')} ready${r.labelled ? `, ${r.labelled} with labels from the dataset` : ''}.`, 'ok', 'Import complete');
+    toast(`${plural(r.frames ?? 0, 'frame')} ready${r.labelled ? `, ${r.labelled} with labels from the dataset` : ''}.`, 'ok', title('Import complete'));
     refreshFrames();
   } else if (job.kind === 'autolabel') {
     toast(r.objects
       ? `${plural(r.objects, 'object')} found across ${plural(r.framesWithObjects, 'frame')}.`
       : 'No matches. Try a lower confidence, or describe the object differently.',
-      r.objects ? 'ok' : 'warn', 'Auto-label complete');
+      r.objects ? 'ok' : 'warn', title('Auto-label complete'));
   } else if (job.kind === 'track') {
-    toast(`${plural(r.objects ?? 0, 'object')} tracked through ${plural(r.frames ?? 0, 'frame')}.`, 'ok', 'Tracking complete');
+    toast(`${plural(r.objects ?? 0, 'object')} tracked through ${plural(r.frames ?? 0, 'frame')}.`, 'ok', title('Tracking complete'));
   } else if (job.kind === 'prompt') {
     toast(r.objects
       ? `${plural(r.objects, 'match', 'matches')} added to this frame.`
@@ -732,11 +737,11 @@ function onJobFinished(job) {
       (r.errors || []).length ? 'error' : (r.changed ? 'ok' : 'warn'), job.label);
   } else if (job.kind === 'train') {
     const where = r.best || r.save_dir || '';
-    toast(where ? `Weights saved to ${where}` : 'Training finished.', 'ok', 'Training complete');
+    toast(where ? `Weights saved to ${where}` : 'Training finished.', 'ok', title('Training complete'));
   } else if (job.kind === 'convert') {
-    toast(`${r.converted_items ?? 0} converted, ${r.fallback_items ?? 0} fell back, ${r.failed_items ?? 0} failed → ${r.output_dir || ''}`, 'ok', 'Conversion complete');
+    toast(`${r.converted_items ?? 0} converted, ${r.fallback_items ?? 0} fell back, ${r.failed_items ?? 0} failed → ${r.output_dir || ''}`, 'ok', title('Conversion complete'));
   } else if (job.kind === 'onnx') {
-    toast(`Saved to ${r.path}`, 'ok', 'ONNX export complete');
+    toast(`Saved to ${r.path}`, 'ok', title('ONNX export complete'));
   }
 }
 
