@@ -244,6 +244,8 @@ class Session:
             "height": ann.height,
             "source": os.path.basename(ann.source_video or ann.source_image or ""),
             "isVideo": bool(ann.source_video),
+            "heldOut": ann.held_out,
+            "exported": ann.exported,
         }
 
     def frames_meta(self) -> list[dict]:
@@ -274,9 +276,34 @@ class Session:
         cv2.imwrite(thumb, img, [cv2.IMWRITE_JPEG_QUALITY, 80])
         return thumb
 
+    def is_held_out(self, index: int) -> bool:
+        ann = self.store.get(index)
+        return bool(ann is not None and ann.held_out)
+
+    def set_held_out(self, indices: Iterable[int], held: bool) -> int:
+        """Hold frames out to be measured against, or put them back in play.
+
+        Holding a frame out does not change its labels; it stops anything else
+        from changing them.  Whoever holds a frame out is saying its labels are
+        the ones to trust, so this is the one thing an agent working on the
+        session should not be doing to itself.
+        """
+        changed = 0
+        for index in indices:
+            ann = self.store.get(index)
+            if ann is None or ann.held_out == bool(held):
+                continue
+            ann.held_out = bool(held)
+            changed += 1
+            self.emit({"type": "frame", "event": "updated", "frame": self.frame_meta(ann)})
+        if changed:
+            self.touch()
+            self.save_state()
+        return changed
+
     def set_boxes(self, index: int, boxes: list[BBox], status: str | None = None) -> dict | None:
         ann = self.store.get(index)
-        if ann is None:
+        if ann is None or ann.held_out:
             return None
         ann.boxes = boxes
         if status:
@@ -293,7 +320,7 @@ class Session:
     def apply_auto_boxes(self, index: int, boxes: list[BBox], policy: str) -> None:
         """Merge SAM output into a frame according to the chosen label policy."""
         ann = self.store.get(index)
-        if ann is None:
+        if ann is None or ann.held_out:
             return
         if policy == SKIP and ann.boxes:
             return
@@ -350,7 +377,7 @@ class Session:
             if should_abort and should_abort():
                 break
             ann = self.store.get(index)
-            if ann is None or len(ann.boxes) < 2:
+            if ann is None or ann.held_out or len(ann.boxes) < 2:
                 continue
             self._read_size(ann)
             merged, dropped = boxops.merge_overlaps(
@@ -426,9 +453,13 @@ class Session:
 
         wanted = list(frames) if frames is not None else sorted(self.store)
         views = []
+        spared = 0
         for index in wanted:
             ann = self.store.get(index)
             if ann is None:
+                continue
+            if ann.held_out:
+                spared += 1
                 continue
             self._read_size(ann)
             views.append(scripts.FrameView(ann, self.class_names, self.task))
@@ -456,12 +487,16 @@ class Session:
 
         result = report.to_dict()
         result["changed"] = written
+        result["heldOut"] = spared
         return result
 
     def delete_frames(self, indices: Iterable[int]) -> int:
         removed = 0
         with self._lock:
             for index in list(indices):
+                held = self.store.get(index)
+                if held is not None and held.held_out:
+                    continue
                 if self.store.pop(index, None) is not None:
                     removed += 1
                     thumb = os.path.join(THUMBS_DIR, f"{index:06d}.jpg")
@@ -530,6 +565,33 @@ class Session:
     # ──────────────────────────────────────────────────────────────
     # Media import
     # ──────────────────────────────────────────────────────────────
+
+    def plan_import(self, path: str, mode: str) -> tuple[str, str | None, str]:
+        """Work out what a path actually holds, before importing it.
+
+        It can be a plain pile of pictures, a YOLO dataset root carrying its
+        own classes, the images/ directory inside one, or a single video.  The
+        browser and the command line have to make the same sense of it or the
+        same folder would import two different ways, so both ask here.
+
+        Returns (images_dir, labels_dir or None, task named by any data.yaml).
+        """
+        if not os.path.isdir(path) or mode not in ("replace", "dataset"):
+            return path, None, "detect"
+
+        images_dir, labels_dir, yaml_path = self.resolve_dataset_dirs(path)
+        dataset_task = "detect"
+        if mode == "dataset" and not labels_dir and not yaml_path:
+            # A plain media folder chosen in dataset mode — import it as media.
+            images_dir, labels_dir = path, None
+        if yaml_path:
+            dataset_task = self.apply_dataset_yaml(yaml_path)["task"]
+        elif mode == "dataset":
+            self.toast("No data.yaml found — importing images only, classes unchanged.",
+                       "warn")
+        if mode == "replace" and not labels_dir:
+            images_dir = path
+        return images_dir, labels_dir, dataset_task
 
     def start_import(
         self,
@@ -736,6 +798,12 @@ class Session:
         label: str = "Auto-labelling",
     ) -> Job:
         threshold = self.threshold if threshold is None else threshold
+        # apply_auto_boxes refuses a held-out frame whatever arrives for it, so
+        # running the model over one only spends the time to throw the answer
+        # away.  Dropping them here also makes the count in the progress line
+        # the number of frames that can actually change.
+        frames = [(i, p) for i, p in frames
+                  if not (i in self.store and self.store[i].held_out)]
         if policy == SKIP:
             frames = [(i, p) for i, p in frames
                       if i in self.store and not self.store[i].boxes]
@@ -976,6 +1044,8 @@ class Session:
                 per_class[name] = per_class.get(name, 0) + 1
         return {
             "frames": total,
+            "heldOut": sum(1 for a in self.store.values() if a.held_out),
+            "exported": sum(1 for a in self.store.values() if a.exported),
             "labelled": labelled,
             "unlabelled": total - labelled,
             "boxes": boxes,

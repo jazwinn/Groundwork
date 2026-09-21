@@ -120,21 +120,37 @@ def export_dataset(
     skip_unverified: bool = False,
     is_seg: bool = False,
     is_pose: bool = False,
-) -> int:
+) -> dict:
     """
-    Write YOLO dataset to output_dir.  Returns the number of frames exported.
-    Frames with status "exported" are re-exported (idempotent).
+    Write YOLO dataset to output_dir.  Returns what went where, and a warning
+    when the split cannot mean anything.
+    Frames already exported are re-exported (idempotent).  Exporting records
+    itself on the frame and leaves `status` alone: whether a person has
+    checked a frame is not something exporting it can answer.
     If skip_unverified is True, frames still in "pending" status are skipped.
     If is_seg is True, labels use YOLO segmentation polygon format.
     If is_pose is True, labels use YOLO pose format with 4 corner keypoints
     (TL, TR, BR, BL) extracted from the segmentation polygon when available.
+
+    Frames held out are listed in val.txt and every other frame in train.txt, so
+    a score means something.  Pointing both halves at the same pictures — which
+    is what this did until it learned to split — makes a model that has
+    memorised the answers look like a model that has learned the job, and the
+    better it memorises the better it scores.  With nothing held out that is
+    still what happens, so it says so in the warning rather than reporting a
+    number that reads like a real one.
+
+    The split is two lists rather than two folders because everything else that
+    reads an exported dataset — importing it back, converting it between tasks,
+    the folder browser — looks for the pictures directly under images/, and
+    moving them into subfolders would quietly empty all of it.
     """
     images_dir = os.path.join(output_dir, "images")
     labels_dir = os.path.join(output_dir, "labels")
     os.makedirs(images_dir, exist_ok=True)
     os.makedirs(labels_dir, exist_ok=True)
 
-    exported_count = 0
+    listed: dict[str, list[str]] = {"train": [], "val": []}
 
     for frame_index, annotation in sorted(store.items()):
         if skip_unverified and annotation.status == "pending":
@@ -149,6 +165,7 @@ def export_dataset(
             continue
         img_h, img_w = img.shape[:2]
 
+        split = "val" if annotation.held_out else "train"
         stem = f"frame_{frame_index:06d}"
         dst_img = os.path.join(images_dir, f"{stem}.png")
         dst_lbl = os.path.join(labels_dir, f"{stem}.txt")
@@ -165,8 +182,13 @@ def export_dataset(
         with open(dst_lbl, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
 
-        annotation.status = "exported"
-        exported_count += 1
+        annotation.exported = True
+        listed[split].append(f"./images/{stem}.png")
+
+    counts = {split: len(names) for split, names in listed.items()}
+    for split, names in listed.items():
+        with open(os.path.join(output_dir, f"{split}.txt"), "w", encoding="utf-8") as fh:
+            fh.write("\n".join(names) + ("\n" if names else ""))
 
     # Write data.yaml
     yaml_path = os.path.join(output_dir, "data.yaml")
@@ -177,10 +199,26 @@ def export_dataset(
         task = "segment"
     else:
         task = "detect"
+    # With nothing held out there is no validation half to point at, so it falls
+    # back to scoring against the training pictures — the old behaviour, kept so
+    # that a session which has never held anything out still trains, and called
+    # out so the number it produces is not mistaken for a measurement.
+    warning = ""
+    if counts["val"] == 0:
+        val_list = "train.txt"
+        warning = ("No frames are held out, so the score is measured on the same "
+                   "pictures the model trains on and will read far better than "
+                   "the model is. Hold some frames out to measure anything.")
+    else:
+        val_list = "val.txt"
+    if counts["train"] == 0:
+        warning = ("Every exported frame is held out, so there is nothing left to "
+                   "train on. Put some frames back in play.")
+
     data_yaml: dict = {
         "path":  os.path.abspath(output_dir).replace("\\", "/"),
-        "train": "images",
-        "val":   "images",
+        "train": "train.txt",
+        "val":   val_list,
         "nc":    len(names_list),
         "names": names_list,
         "task":  task,
@@ -190,4 +228,9 @@ def export_dataset(
     with open(yaml_path, "w", encoding="utf-8") as fh:
         yaml.dump(data_yaml, fh, Dumper=_YAMLDumper, default_flow_style=False, sort_keys=False)
 
-    return exported_count
+    return {
+        "frames": counts["train"] + counts["val"],
+        "train": counts["train"],
+        "val": counts["val"],
+        "warning": warning,
+    }

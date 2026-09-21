@@ -247,7 +247,14 @@ button, select, input, textarea { font:inherit; color:inherit; }
 }
 .thumb-n.pending { color:var(--warn); }
 .thumb-n.verified { color:var(--ok); }
-.thumb-n.exported { color:var(--text-dim); }
+/* Exported is shown as a mark of its own.  It used to grey out the count, which
+   meant an exported frame looked identical whether or not anyone had checked
+   it — the same conflation that made exporting erase review state. */
+.thumb[data-exported="true"]::after {
+  content:''; position:absolute; left:3px; bottom:3px;
+  width:4px; height:4px; border-radius:50%;
+  background:var(--text-dim);
+}
 
 .filmstrip-empty {
   padding:18px 12px;
@@ -343,6 +350,8 @@ kbd {
 }
 .ghost:hover:not(:disabled) { color:var(--text); border-color:var(--line); background:var(--ink-750); }
 .ghost:disabled { opacity:.4; cursor:default; }
+/* A view toggle in its off position — readable, plainly not engaged. */
+.ghost[aria-pressed="false"] { color:var(--text-faint); border-style:dashed; }
 
 .inline-field {
   display:flex; align-items:center; gap:6px;

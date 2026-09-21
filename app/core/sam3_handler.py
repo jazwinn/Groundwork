@@ -68,11 +68,21 @@ class FrameAnnotation:
     frame_index: int
     image_path: str
     boxes: list[BBox] = field(default_factory=list)
-    status: str = "pending"   # "pending" | "verified" | "exported"
+    status: str = "pending"   # "pending" | "verified" — whether a person has checked it
     source_video: str = ""    # absolute path of the source video (empty for still images)
     source_image: str = ""    # absolute path of the source image (empty for video frames)
     width: int = 0
     height: int = 0
+    # Held out to measure against: exported as the validation half, and refused
+    # by everything that writes labels.  A frame cannot be both the ruler and
+    # the thing being measured, so this is enforced rather than agreed to.
+    held_out: bool = False
+    # Whether this frame has been written into a dataset.  Kept apart from
+    # `status`, which is about whether a person has checked the labels: those
+    # are two different facts, and while "exported" was a third status value
+    # exporting overwrote the answer to the first question with the answer to
+    # the second, losing track of what had been reviewed every time.
+    exported: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -84,19 +94,32 @@ class FrameAnnotation:
             "source_image": self.source_image,
             "width": self.width,
             "height": self.height,
+            "held_out": self.held_out,
+            "exported": self.exported,
         }
 
     @staticmethod
     def from_dict(d: dict) -> "FrameAnnotation":
+        # Sessions written while "exported" was a status carry no review state
+        # for those frames — exporting had already overwritten it, and the
+        # answer is not recoverable.  They come back as reviewed because that is
+        # how the editor has always drawn them, so nothing changes appearance on
+        # the way in; what changes is that exporting stops doing it again.
+        status = d.get("status", "pending")
+        exported = bool(d.get("exported", False))
+        if status == "exported":
+            status, exported = "verified", True
         return FrameAnnotation(
             frame_index=int(d["frame_index"]),
             image_path=d["image_path"],
             boxes=[BBox.from_dict(b) for b in d.get("boxes", [])],
-            status=d.get("status", "pending"),
+            status=status,
             source_video=d.get("source_video", ""),
             source_image=d.get("source_image", ""),
             width=int(d.get("width", 0)),
             height=int(d.get("height", 0)),
+            held_out=bool(d.get("held_out", False)),
+            exported=exported,
         )
 
 

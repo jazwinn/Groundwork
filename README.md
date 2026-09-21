@@ -160,6 +160,12 @@ always correct. **Outline detail** controls how closely a shape follows the mask
 mean smaller labels and faster training, so prefer the coarsest setting that still traces
 the object.
 
+An object that carries an outline also gets a green rectangle around it, so the shape and
+its bounding box never read as one line. While you are tracing, that rectangle is mostly
+in the way — **Boxes** in the toolbar, or `H`, turns it off and leaves the outline alone.
+A box with no outline keeps its rectangle either way, since that is all it has. The
+setting is remembered.
+
 Snapping is fast because nearly all of its cost is reading the picture, and that only has
 to happen once per frame. Selecting the Snap tool or opening a frame starts that read in
 the background, so by the time a box is drawn the answer is usually already a tenth of a

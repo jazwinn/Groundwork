@@ -29,6 +29,7 @@ const UI_DEFAULTS = {
   nativeDialogs: true,
   mergeThreshold: 0.8,
   mergeSameClass: true,
+  wrapperBoxes: true,
   script: '',
   // Per script, and only the settings moved off that script's own
   // defaults — editing a default in the file is then picked up.
@@ -39,6 +40,9 @@ const UI_DEFAULTS = {
   augment: {},
   open: {},
 };
+
+const UI_KEY = 'groundwork.ui';
+const UI_KEY_LEGACY = 'modeltrainer.ui';   // what it was called before the rename
 
 const app = {
   state: { classes: ['object'], task: 'detect', samModel: '', samModels: [], threshold: 0.5, frames: [], stats: {}, device: {}, augmentations: [], scripts: [] },
@@ -61,9 +65,6 @@ const app = {
   scriptsDir: '',
   scriptReport: null,
 };
-
-const UI_KEY = 'groundwork.ui';
-const UI_KEY_LEGACY = 'modeltrainer.ui';   // what it was called before the rename
 
 function loadUi() {
   try {
@@ -99,6 +100,7 @@ const dom = {
   saveState: document.getElementById('saveState'),
   selectionInfo: document.getElementById('selectionInfo'),
   mergeBtn: document.getElementById('mergeBtn'),
+  wrapperBtn: document.getElementById('wrapperBtn'),
   clearFrameBtn: document.getElementById('clearFrameBtn'),
   dropFrameBtn: document.getElementById('dropFrameBtn'),
   stripSelection: document.getElementById('stripSelection'),
@@ -251,6 +253,7 @@ function updateThumb(node, frame) {
   const badge = node.querySelector('.thumb-n');
   badge.textContent = frame.boxes ? String(frame.boxes) : '';
   badge.className = `thumb-n ${frame.status}`;
+  node.setAttribute('data-exported', frame.exported ? 'true' : 'false');
 }
 
 /** Filmstrip click: plain picks one, Shift takes a range, Ctrl adds or removes. */
@@ -356,8 +359,7 @@ async function selectFrame(index, { scroll = false, keepSelection = false } = {}
 
 function updateReviewButton() {
   const btn = document.getElementById('reviewBtn');
-  const status = app.frameDetail?.status;
-  const reviewed = status === 'verified' || status === 'exported';
+  const reviewed = app.frameDetail?.status === 'verified';
   btn.textContent = reviewed ? 'Reviewed ✓' : 'Mark reviewed';
   btn.disabled = app.currentIndex === null;
   btn.title = reviewed
@@ -531,6 +533,26 @@ function maskMode() {
   return app.state.task === 'segment';
 }
 
+/**
+ * Show or hide the rectangle drawn around an outlined object.
+ *
+ * Tracing a shape means watching its edge, and a bright rectangle following it
+ * around competes for exactly that attention. Boxes with no outline keep their
+ * rectangle regardless — it is all they have.
+ */
+function setWrapperBoxes(on) {
+  app.ui.wrapperBoxes = on;
+  app.editor.showWrappers = on;
+  dom.wrapperBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  dom.wrapperBtn.title = on
+    ? 'Hide the box drawn around an outlined object'
+    : 'Show the box drawn around an outlined object';
+  app.editor.render();
+  // Saved here rather than left to the next panel render: this is a toolbar
+  // button and can easily be the last thing touched before the tab closes.
+  saveUi();
+}
+
 function setTool(tool) {
   if ((tool === 'outline' || tool === 'snap') && !maskMode()) {
     toast('Switch “What you are labelling” to Outlines first.', 'warn');
@@ -584,6 +606,7 @@ const SHORTCUTS = [
     ['Drag a point', 'Move it — the box follows the outline'],
     ['Click an edge', 'Add a point there'],
     ['Right-click a point', 'Remove it'],
+    ['H', 'Show or hide the box around an outlined object'],
   ]],
   ['Selecting', [
     ['Click', 'Select one box'],
@@ -893,6 +916,9 @@ function bind() {
 
   dom.activeClass.addEventListener('change', () => app.setClass(+dom.activeClass.value));
   dom.filter.value = app.ui.filter;
+  // Assigning a value the select does not offer leaves it showing blank,
+  // so a setting remembered from an older build falls back to All frames.
+  if (!dom.filter.value) { dom.filter.value = 'all'; app.ui.filter = 'all'; }
   dom.filter.addEventListener('change', () => { app.ui.filter = dom.filter.value; saveUi(); renderStrip(); });
 
   document.getElementById('prevFrame').onclick = () => step(-1);
@@ -900,13 +926,14 @@ function bind() {
   document.getElementById('zoomIn').onclick = () => app.editor.zoomBy(1.25);
   document.getElementById('zoomOut').onclick = () => app.editor.zoomBy(1 / 1.25);
   document.getElementById('zoomFit').onclick = () => app.editor.fit();
+  dom.wrapperBtn.onclick = () => setWrapperBoxes(!app.ui.wrapperBoxes);
   document.getElementById('undoBtn').onclick = () => { if (!app.editor.undo()) toast('Nothing left to undo on this frame.', 'warn'); };
   dom.clearFrameBtn.onclick = () => clearSelectedFrames();
   dom.mergeBtn.onclick = () => mergeSelected();
   document.getElementById('helpBtn').onclick = () => showShortcuts();
   document.getElementById('reviewBtn').onclick = async () => {
     if (app.currentIndex === null) return;
-    const reviewed = app.frameDetail?.status === 'verified' || app.frameDetail?.status === 'exported';
+    const reviewed = app.frameDetail?.status === 'verified';
     const res = await api.putStatus(app.currentIndex, reviewed ? 'pending' : 'verified');
     app.frameDetail.status = res.frame.status;
     app.state.stats = res.stats;
@@ -946,6 +973,7 @@ function bind() {
       case 'e': case 'E': setTool('pos'); break;
       case 'x': case 'X': setTool('neg'); break;
       case 'f': case 'F': app.editor.fit(); break;
+      case 'h': case 'H': setWrapperBoxes(!app.ui.wrapperBoxes); break;
       case 'm': case 'M': mergeSelected(); break;
       case 'Escape':
         if (!app.editor.cancelOutline()) app.editor.select(null);
@@ -1009,6 +1037,7 @@ async function main() {
 
   bind();
   setTool('select');
+  setWrapperBoxes(app.ui.wrapperBoxes !== false);
   app.goStep('media');
 
   try {

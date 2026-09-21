@@ -34,7 +34,12 @@ Thumbs.db
 
 # Misc
 .env
-.claude
+# Everything under .claude is local, except the skills — those are instructions
+# for working on this repo and are no use to anyone if they only exist on one
+# machine. The contents are excluded rather than the folder itself, because git
+# does not look inside an excluded folder and the exception would never be read.
+.claude/*
+!.claude/skills/
 test videos/
 Trained Models/
 dataset/

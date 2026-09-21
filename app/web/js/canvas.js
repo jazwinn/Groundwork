@@ -54,6 +54,9 @@ export class Editor {
     this.classNames = ['object'];
     this.classId = 0;
     this.tool = 'select';
+    // The rectangle around an outlined object is a reading aid, not the
+    // label. While tracing shapes it is mostly in the way, so it can go.
+    this.showWrappers = true;
 
     this.positives = [];
     this.negatives = [];
@@ -372,6 +375,10 @@ export class Editor {
     const color = classColor(box.class_id);
     const isSelected = this.isSelected(box);
     const machine = box.source === 'sam';
+    // With wrappers off, an outlined object is shown by its outline alone. A
+    // box with no outline keeps its rectangle either way - that rectangle is
+    // the only thing it has.
+    const bare = this.hasOutline(box) && !this.showWrappers;
 
     // Polygon (segmentation) first, so the box outline sits on top.
     if (box.polygon && box.polygon.length >= 6) {
@@ -383,25 +390,36 @@ export class Editor {
         if (i === 0) ctx.moveTo(p.x, p.y); else ctx.lineTo(p.x, p.y);
       }
       ctx.closePath();
-      ctx.fillStyle = hexToRgba(color, 0.18);
+      ctx.fillStyle = hexToRgba(color, bare && isSelected ? 0.3 : 0.18);
       ctx.fill();
       ctx.strokeStyle = hexToRgba(color, 0.9);
       ctx.lineWidth = LINE.polygon;
       ctx.stroke();
+      // Selection normally reads as a filled rectangle with a white dashed
+      // edge. With no rectangle to put that on, the shape itself wears it.
+      if (bare && isSelected) {
+        ctx.setLineDash([5, 3]);
+        ctx.lineWidth = LINE.selection;
+        ctx.strokeStyle = 'rgba(255,255,255,.95)';
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
       ctx.restore();
     }
 
     ctx.save();
-    ctx.lineWidth = isSelected ? LINE.boxSelected : LINE.box;
-    // An object that carries an outline gets a green rectangle, so the shape
-    // and the box around it never read as one line.
-    ctx.strokeStyle = this.hasOutline(box) ? WRAPPER_COLOR : color;
-    // Dashed = suggested by SAM and not yet confirmed; solid = human-made.
-    ctx.setLineDash(machine && !isSelected ? LINE.dash : []);
-    ctx.strokeRect(a.x, a.y, w, h);
-    ctx.setLineDash([]);
+    if (!bare) {
+      ctx.lineWidth = isSelected ? LINE.boxSelected : LINE.box;
+      // An object that carries an outline gets a green rectangle, so the shape
+      // and the box around it never read as one line.
+      ctx.strokeStyle = this.hasOutline(box) ? WRAPPER_COLOR : color;
+      // Dashed = suggested by SAM and not yet confirmed; solid = human-made.
+      ctx.setLineDash(machine && !isSelected ? LINE.dash : []);
+      ctx.strokeRect(a.x, a.y, w, h);
+      ctx.setLineDash([]);
+    }
 
-    if (isSelected) {
+    if (isSelected && !bare) {
       ctx.fillStyle = hexToRgba(color, 0.14);
       ctx.fillRect(a.x, a.y, w, h);
       // A pale marching-ants outline inside the class colour: selection has to

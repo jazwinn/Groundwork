@@ -14,6 +14,11 @@ import numpy as np
 import yaml
 from PIL import Image
 
+from app.core.yolo_pose_converter import (
+    pairs_from_list as _pairs_from_list,
+    _write_split_lists,
+)
+
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
 _log = logging.getLogger(__name__)
 
@@ -90,6 +95,7 @@ class YoloDatasetConverter:
         self._emit_status(f"Found {total} images across {len(active_splits)} split(s). Converting…")
 
         aborted = False
+        listed: dict[str, list[str]] = {}
         for i, (split_name, img_path, lbl_path) in enumerate(all_pairs):
             if self._should_abort and self._should_abort():
                 aborted = True
@@ -105,6 +111,9 @@ class YoloDatasetConverter:
                 c, f = self._process_image(img_path, lbl_path, out_img_dir, out_lbl_dir)
                 converted_items += c
                 fallback_items += f
+                # Which half this picture came from, kept so the output can be
+                # split the same way the input was.
+                listed.setdefault(split_name, []).append(f"./images/{img_path.name}")
             except Exception as exc:
                 _log.warning("Skipping %s: %s", img_path.name, exc)
                 failed_items += 1
@@ -112,7 +121,7 @@ class YoloDatasetConverter:
             if self._progress_callback:
                 self._progress_callback(i + 1, total)
 
-        self._write_yaml(self.output_root, yaml_data, active_splits)
+        self._write_yaml(self.output_root, yaml_data, active_splits, listed)
 
         return {
             "status": "cancelled" if aborted else "success",
@@ -174,8 +183,11 @@ class YoloDatasetConverter:
                 candidate = yaml_data["yaml_dir"] / split_path_raw
 
         if not candidate.exists():
-            _log.warning("Split dir not found: %s", candidate)
+            _log.warning("Split not found: %s", candidate)
             return []
+
+        if candidate.is_file():
+            return _pairs_from_list(candidate, yaml_data)
 
         images_dir = (candidate / "images") if (candidate / "images").is_dir() else candidate
         labels_dir = images_dir.parent / "labels"
@@ -519,7 +531,8 @@ class YoloDatasetConverter:
     # ------------------------------------------------------------------
 
     def _write_yaml(
-        self, output_root: Path, yaml_data: dict, splits: list[str]
+        self, output_root: Path, yaml_data: dict, splits: list[str],
+        listed: dict[str, list[str]] | None = None,
     ) -> None:
         out: dict = {
             "path":  output_root.resolve().as_posix(),
@@ -527,11 +540,18 @@ class YoloDatasetConverter:
             "names": yaml_data["_raw"].get("names"),
             "task":  "segment",
         }
-        # All splits share the same flat images/ folder at the dataset root.
-        # Ultralytics requires at least train + val — if val is absent, point it
-        # at the same images/ directory so training doesn't fail on missing key.
+        # All splits share the same flat images/ folder at the dataset root, so
+        # naming that folder for both halves would make the validation half the
+        # training half — a model scored on what it memorised, reading better
+        # the more it overfits.  The split the source came in with is written
+        # back out as lists, so converting cannot silently undo it.  Falling
+        # back to the folder is kept for a source that had no split to carry:
+        # Ultralytics needs train and val to exist at all.
+        written = _write_split_lists(output_root, listed or {})
         for split_name in ("train", "val", "test"):
-            if split_name in splits or split_name in ("train", "val"):
+            if split_name in written:
+                out[split_name] = f"{split_name}.txt"
+            elif split_name in splits or split_name in ("train", "val"):
                 out[split_name] = "images"
         with open(output_root / "data.yaml", "w", encoding="utf-8") as fh:
             yaml.dump(out, fh, default_flow_style=False, sort_keys=False)

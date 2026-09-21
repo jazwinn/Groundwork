@@ -22,6 +22,7 @@ data.yaml gains:
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import time
 from pathlib import Path
@@ -32,6 +33,51 @@ import numpy as np
 import yaml
 
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
+
+
+def pairs_from_list(list_file: Path, yaml_data: dict) -> list[tuple[Path, Path | None]]:
+    """Read a data.yaml split that names a txt file rather than a folder.
+
+    Both layouts are ordinary YOLO.  A dataset can put its splits in separate
+    directories, or keep one images/ directory and name the members of each
+    split in a text file — which is what Groundwork's own export writes, since
+    holding a frame out changes which list it belongs to and not where its
+    picture lives.  Reading only the first meant the app could not convert the
+    datasets it had just written.
+    """
+    root = Path(yaml_data["path"]) if yaml_data.get("path") else yaml_data["yaml_dir"]
+    pairs: list[tuple[Path, Path | None]] = []
+    for line in list_file.read_text(encoding="utf-8").splitlines():
+        entry = line.strip()
+        if not entry:
+            continue
+        img_path = Path(entry)
+        if not img_path.is_absolute():
+            img_path = Path(os.path.normpath(root / entry))
+        if img_path.suffix.lower() not in _IMAGE_EXTS or not img_path.is_file():
+            continue
+        lbl = img_path.parent.parent / "labels" / (img_path.stem + ".txt")
+        pairs.append((img_path, lbl if lbl.is_file() else None))
+    return pairs
+
+
+def _write_split_lists(output_root: Path, listed: dict[str, list[str]]) -> set[str]:
+    """Write train.txt / val.txt / test.txt beside a converted dataset.
+
+    Returns the names actually written, so a split that produced nothing is
+    left out rather than written empty — an empty val.txt trains fine and
+    scores nothing, which looks like success.
+    """
+    written: set[str] = set()
+    for split_name, names in listed.items():
+        if not names:
+            continue
+        (output_root / f"{split_name}.txt").write_text(
+            "\n".join(names) + "\n", encoding="utf-8")
+        written.add(split_name)
+    return written
+
+
 _log = logging.getLogger(__name__)
 
 # ── Shared corner-extraction helper ─────────────────────────────────────────
@@ -179,6 +225,7 @@ class YoloPoseConverter:
         )
 
         aborted = False
+        listed: dict[str, list[str]] = {}
         for i, (split_name, img_path, lbl_path) in enumerate(all_pairs):
             if self._should_abort and self._should_abort():
                 aborted = True
@@ -194,6 +241,9 @@ class YoloPoseConverter:
                 c, f = self._process_image(img_path, lbl_path, out_img_dir, out_lbl_dir)
                 converted_items += c
                 fallback_items += f
+                # Which half this picture came from, kept so the output can be
+                # split the same way the input was.
+                listed.setdefault(split_name, []).append(f"./images/{img_path.name}")
             except Exception as exc:
                 _log.warning("Skipping %s: %s", img_path.name, exc)
                 failed_items += 1
@@ -201,7 +251,7 @@ class YoloPoseConverter:
             if self._progress_callback:
                 self._progress_callback(i + 1, total)
 
-        self._write_yaml(self.output_root, yaml_data, active_splits)
+        self._write_yaml(self.output_root, yaml_data, active_splits, listed)
 
         return {
             "status": "cancelled" if aborted else "success",
@@ -264,8 +314,11 @@ class YoloPoseConverter:
                 candidate = yaml_data["yaml_dir"] / split_path_raw
 
         if not candidate.exists():
-            _log.warning("Split dir not found: %s", candidate)
+            _log.warning("Split not found: %s", candidate)
             return []
+
+        if candidate.is_file():
+            return pairs_from_list(candidate, yaml_data)
 
         images_dir = (candidate / "images") if (candidate / "images").is_dir() else candidate
         labels_dir = images_dir.parent / "labels"
@@ -410,6 +463,7 @@ class YoloPoseConverter:
         output_root: Path,
         yaml_data: dict,
         splits: list[str],
+        listed: dict[str, list[str]] | None = None,
     ) -> None:
         out: dict = {
             "path":      output_root.resolve().as_posix(),
@@ -418,8 +472,16 @@ class YoloPoseConverter:
             "task":      "pose",
             "kpt_shape": [4, 3],
         }
+        # Every picture lands in one images/ directory, so pointing both halves
+        # at that directory would make the validation half the training half —
+        # a model scored on what it memorised, reading better the more it
+        # overfits.  The split the source came in with is written back out as
+        # lists instead, so converting a dataset cannot silently undo it.
+        written = _write_split_lists(output_root, listed or {})
         for split_name in ("train", "val", "test"):
-            if split_name in splits or split_name in ("train", "val"):
+            if split_name in written:
+                out[split_name] = f"{split_name}.txt"
+            elif split_name in splits or split_name in ("train", "val"):
                 out[split_name] = "images"
         # Use inline list for kpt_shape to match Ultralytics convention: [4, 3]
         class _Inline(list):

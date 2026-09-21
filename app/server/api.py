@@ -16,13 +16,13 @@ from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.core.jobs import Job
 from app.core.sam3_handler import BBox, SAM_MODELS
 from app.core.sam2_trainer import SAM2_MODELS, train_sam2
-from app.core import maskops, scripts
+from app.core import maskops, overlay, scripts
 from app.core.session import MERGE, REPLACE, SKIP, TASKS, Session
 from app.core.yolo_trainer import (
     AUGMENTATIONS, DETECTION_MODELS, POSE_MODELS, RUNS_DIR, SEGMENTATION_MODELS,
@@ -330,28 +330,15 @@ async def import_media(payload: dict = Body(...)) -> dict:
     mode = payload.get("mode", "replace")
     stride = max(1, int(payload.get("stride", 1)))
 
-    if not os.path.isdir(path):
-        raise HTTPException(400, f"Not a folder: {path}")
+    # A folder is what the picker gives, but the loader has always been able to
+    # read a single video or image, and the command line can say one.
+    if not os.path.exists(path):
+        raise HTTPException(400, f"No such file or folder: {path}")
     busy = session.jobs.is_busy("import")
     if busy:
         raise HTTPException(409, "An import is already running.")
 
-    labels_dir = None
-    dataset_task = "detect"
-    images_dir = path
-
-    if mode in ("replace", "dataset"):
-        images_dir, labels_dir, yaml_path = Session.resolve_dataset_dirs(path)
-        if mode == "dataset" and not labels_dir and not yaml_path:
-            # Plain media folder chosen in dataset mode — import it as media.
-            images_dir, labels_dir = path, None
-        if yaml_path:
-            info = session.apply_dataset_yaml(yaml_path)
-            dataset_task = info["task"]
-        elif mode == "dataset":
-            session.toast("No data.yaml found — importing images only, classes unchanged.", "warn")
-        if mode == "replace" and not labels_dir:
-            images_dir = path
+    images_dir, labels_dir, dataset_task = session.plan_import(path, mode)
 
     job = session.start_import(
         images_dir, mode=mode, stride=stride,
@@ -375,6 +362,22 @@ async def frame_image(index: int):
     if ann is None or not os.path.isfile(ann.image_path):
         raise HTTPException(404, "Frame not found")
     return FileResponse(ann.image_path, media_type="image/png")
+
+
+@app.get("/api/frames/{index}/render")
+async def frame_render(index: int, labels: bool = True):
+    """The frame with its labels drawn on — what the editor shows, as a picture.
+
+    For anything that has to judge a label without being a browser: whether an
+    outline follows the object, whether one object has been cut in two.
+    """
+    ann = session.get(index)
+    if ann is None:
+        raise HTTPException(404, "Frame not found")
+    img = await run_in_threadpool(overlay.render, ann, session.class_names, labels=labels)
+    if img is None:
+        raise HTTPException(404, "The picture for this frame could not be read.")
+    return Response(content=overlay.encode_png(img), media_type="image/png")
 
 
 @app.get("/api/frames/{index}/thumb")
@@ -407,16 +410,33 @@ async def put_boxes(index: int, payload: dict = Body(...)) -> dict:
     ann = session.get(index)
     if ann is None:
         raise HTTPException(404, "Frame not found")
+    if ann.held_out:
+        raise HTTPException(
+            409, f"Frame {index} is held out to measure against, so its labels "
+                 f"cannot be changed. Put it back in play first.")
     boxes = [BBox.from_dict(b) for b in payload.get("boxes", [])]
     meta = session.set_boxes(index, boxes, status=payload.get("status"))
     return {"frame": meta, "stats": session.stats()}
 
 
+@app.post("/api/frames/hold")
+async def hold_frames(payload: dict = Body(...)) -> dict:
+    """Hold frames out to measure against, or put them back in play."""
+    indices = payload.get("indices")
+    if not isinstance(indices, list) or not indices:
+        raise HTTPException(400, "Say which frames, as a list of indices.")
+    held = bool(payload.get("held", True))
+    changed = session.set_held_out([int(i) for i in indices], held)
+    return {"changed": changed, "held": held, "stats": session.stats()}
+
+
 @app.put("/api/frames/{index}/status")
 async def put_status(index: int, payload: dict = Body(...)) -> dict:
     status = payload.get("status", "verified")
-    if status not in ("pending", "verified", "exported"):
-        raise HTTPException(400, f"Unknown status: {status}")
+    if status not in ("pending", "verified"):
+        raise HTTPException(
+            400, f"Unknown status: {status}. A frame is 'pending' or 'verified' — "
+                 f"whether it has been exported is kept separately and set by exporting.")
     meta = session.set_status(index, status)
     if meta is None:
         raise HTTPException(404, "Frame not found")
@@ -748,7 +768,7 @@ async def export(payload: dict = Body(...)) -> dict:
         task = "detect"
     os.makedirs(out_dir, exist_ok=True)
 
-    count = export_dataset(
+    written = export_dataset(
         session.store, session.class_names, out_dir,
         skip_unverified=bool(payload.get("skipUnreviewed")),
         is_seg=task == "segment",
@@ -757,8 +777,13 @@ async def export(payload: dict = Body(...)) -> dict:
     session.task = task
     session.touch()
     session.emit({"type": "frames", "event": "reload"})
+    if written["warning"]:
+        session.toast(written["warning"], "warn")
     return {
-        "frames": count,
+        "frames": written["frames"],
+        "train": written["train"],
+        "val": written["val"],
+        "warning": written["warning"],
         "outDir": out_dir,
         "dataYaml": os.path.join(out_dir, "data.yaml"),
         "task": task,

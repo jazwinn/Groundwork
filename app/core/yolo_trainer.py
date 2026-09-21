@@ -348,3 +348,55 @@ def train_yolo(
         if os.path.isfile(candidate):
             best = candidate
     return {"best": best, "save_dir": save_dir, "stopped_early": stopped["value"]}
+
+
+def score_model(
+    weights: str,
+    data_yaml: str,
+    *,
+    imgsz: int = 640,
+    split: str = "val",
+) -> dict:
+    """Run trained weights over the validation half and report what they scored.
+
+    Training already prints a score per epoch, but that one is whatever the last
+    epoch happened to produce and it moves with the run.  A gate needs one
+    number it can put next to another number from a different run, so the best
+    weights are re-measured here in a pass of their own.
+
+    mAP50-95 leads because mAP50 saturates: once boxes are roughly right it sits
+    near the top and stops separating a good change from a bad one, which is the
+    only thing a gate is for.
+    """
+    from ultralytics import YOLO
+
+    configure_ultralytics_dirs()
+    metrics = YOLO(weights).val(data=data_yaml, imgsz=imgsz, split=split,
+                                verbose=False, plots=False)
+    results = getattr(metrics, "results_dict", {}) or {}
+
+    def pick(*names: str) -> float:
+        for name in names:
+            if name in results:
+                try:
+                    return float(results[name])
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
+
+    box = pick("metrics/mAP50-95(B)", "metrics/mAP50-95")
+    mask = pick("metrics/mAP50-95(M)")
+    pose = pick("metrics/mAP50-95(P)")
+    # Segmentation and pose runs also report a box score; the shape-aware one is
+    # what the label actually claims, so it wins where there is one.
+    headline = mask or pose or box
+    return {
+        "score": round(headline, 5),
+        "mAP50_95": round(headline, 5),
+        "mAP50": round(pick("metrics/mAP50(M)", "metrics/mAP50(P)", "metrics/mAP50(B)"), 5),
+        "box_mAP50_95": round(box, 5),
+        "mask_mAP50_95": round(mask, 5) if mask else None,
+        "pose_mAP50_95": round(pose, 5) if pose else None,
+        "weights": weights,
+        "split": split,
+    }

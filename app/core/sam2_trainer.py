@@ -147,6 +147,11 @@ def _collect_samples_from_dir(
     Expects the standard layout written by export_dataset():
         <dataset_dir>/images/*.png
         <dataset_dir>/labels/*.txt
+        <dataset_dir>/train.txt   — which of them to learn from
+    Fine-tuning reads the training half only.  The held-out pictures are what
+    the result is measured against, and a model that has already seen them
+    cannot be measured by them.  A dataset exported before the split existed has
+    no train.txt, and every picture in it is used as before.
     Handles both detection and segmentation label formats.
     """
     images_dir = os.path.join(dataset_dir, "images")
@@ -157,7 +162,14 @@ def _collect_samples_from_dir(
 
     samples: list[tuple[Image.Image, list[float], np.ndarray]] = []
 
-    for img_name in sorted(os.listdir(images_dir)):
+    train_list = os.path.join(dataset_dir, "train.txt")
+    if os.path.isfile(train_list):
+        with open(train_list, encoding="utf-8") as fh:
+            names = [os.path.basename(line.strip()) for line in fh if line.strip()]
+    else:
+        names = sorted(os.listdir(images_dir))
+
+    for img_name in names:
         stem, ext = os.path.splitext(img_name)
         if ext.lower() not in (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"):
             continue
