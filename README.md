@@ -188,6 +188,44 @@ object sometimes comes back as several pieces. Both have a fix:
 When merged boxes carry masks, the new outline is the convex hull of the originals, so
 nothing is clipped. Pose keypoints become the four corners of the merged box.
 
+#### Your own rules
+
+**Tidy up boxes** is one rule, fixed. **Run a script**, just below it, is the same shape
+with the rule left to you. Drop a `.py` file into `scripts/` and it appears in the panel
+with its own controls and the same two buttons:
+
+```python
+NAME = "Drop tiny boxes"
+
+PARAMS = [
+    {"key": "min_side", "label": "Smallest side", "default": 24,
+     "min": 1, "max": 400, "step": 1, "integer": True, "format": "pixels"},
+]
+
+
+def apply(frame, p):
+    return [b for b in frame.boxes
+            if b.x2 - b.x1 >= p.min_side and b.y2 - b.y1 >= p.min_side]
+```
+
+`apply` is handed one frame and returns the boxes it should end up with. A script that
+needs to see frames together — filling a gap, carrying a class forward — defines
+`apply_all(frames, p)` instead and gets them all, in order. What it declares in `PARAMS`
+becomes sliders, checkboxes, dropdowns and class pickers above the buttons.
+
+Scripts change labels, never the pictures, and they cannot add or remove frames. Editing
+a file is picked up on the next run, with no restart. A script that raises leaves that
+frame exactly as it was and shows you the traceback, pointed at your line; `print()`
+output appears under the buttons. Running on one frame is undone with `Ctrl+Z`; running
+across every frame saves a copy of the session first and tells you where it went.
+
+Four examples ship in `scripts/`, and they are the documentation as much as the reference
+is: dropping small boxes, dropping boxes cut off by the edge, moving boxes between
+classes, and filling label gaps from neighbouring frames.
+
+**[The full reference is in `docs/scripting.md`](docs/scripting.md)** — what a frame and a
+box carry, every parameter type, and what happens when a script goes wrong.
+
 ### 3 · Train
 
 | Action | What it does |
@@ -236,6 +274,8 @@ is the one exception — it says so, because the converter cannot be interrupted
 | Path | Contents |
 |------|----------|
 | `.groundwork/session/` | The current session: decoded frames, thumbnails, `session.json` |
+| `.groundwork/session/backups/` | Copies of the session taken before a script ran across every frame |
+| `scripts/` | Your own label scripts — see [docs/scripting.md](docs/scripting.md) |
 | `runs/train/exp/weights/` | Training checkpoints — `best.pt` and `last.pt` |
 | `runs/export/` | ONNX files exported from checkpoints outside the project |
 | `weights/` | Pretrained weights downloaded by Ultralytics |
@@ -252,6 +292,7 @@ app/
     session.py         the session: frames, classes, models, jobs
     jobs.py            background jobs with progress and cancellation
     boxops.py          merging boxes, by hand and by overlap
+    scripts.py         loading and running your own label scripts
     maskops.py         SAM masks → the outlines a seg label needs
     media_loader.py    images and video → frames
     sam3_handler.py    SAM 3 concept segmentation and video tracking
@@ -265,7 +306,8 @@ app/
     fsbrowse.py        the built-in folder browser used as a fallback
   web/               the interface — plain HTML, CSS and ES modules, no build step
   utils/             YOLO dataset writer
-docs/                the screenshots in this file
+scripts/             your own label scripts, and four examples
+docs/                the screenshots in this file, and how to write a script
 ```
 
 Nothing in `core/` knows about HTTP, so the engine is equally usable from a script.

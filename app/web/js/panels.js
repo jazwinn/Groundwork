@@ -391,6 +391,7 @@ export function labelPanel(app) {
     methodBlock,
     settingsBlock,
     tidyBlock(app, boxCount),
+    scriptBlock(app),
   ]);
 }
 
@@ -677,6 +678,219 @@ function editClasses(app) {
       },
     ],
   });
+}
+
+// ── Your own scripts ───────────────────────────────────────────
+//
+// "Tidy up boxes" above is one rule, fixed. This is the same shape with the
+// rule left to you: whatever .py files are in the scripts folder show up here,
+// each with the controls it asked for, to run on this frame or on all of them.
+
+function scriptBlock(app) {
+  if (app.scriptsState === 'idle') app.refreshScripts();
+
+  const list = app.state.scripts || [];
+  const runnable = list.filter((s) => !s.error);
+  const broken = list.filter((s) => s.error);
+  const chosen = runnable.find((s) => s.id === app.ui.script) || runnable[0] || null;
+  const frames = app.state.frames.length;
+  const body = [];
+
+  if (!list.length) {
+    body.push(el('p', { class: 'block-note', text: app.scriptsState === 'loading'
+      ? 'Reading the scripts folder…'
+      : 'The scripts folder is empty. A .py file with a NAME and an apply(frame, p) function appears here, along with whatever settings it declares.' }));
+  } else if (!chosen) {
+    body.push(el('p', { class: 'block-note', text: 'None of the files in the scripts folder will load. What is wrong with each one is below.' }));
+  } else {
+    const picker = select(runnable.map((s) => [s.id, s.name]), chosen.id);
+    picker.addEventListener('change', () => {
+      app.ui.script = picker.value;
+      app.scriptReport = null;
+      app.renderPanel();
+    });
+    body.push(field('Script', picker, chosen.description));
+
+    for (const spec of chosen.params) body.push(scriptControl(app, chosen, spec));
+
+    const run = async (scope) => {
+      if (scope === 'all') {
+        const ok = await confirmDialog({
+          title: `Run ${chosen.name} on every frame?`,
+          message: `It decides the labels on all ${plural(frames, 'frame')}. Undo only covers the frame you are looking at, so a copy of the session is saved to .groundwork/session/backups first — putting that file back is how this is undone.`,
+          confirmLabel: 'Run it',
+        });
+        if (!ok) return;
+      } else {
+        await app.beforeFrameEdit();     // so Ctrl+Z still puts the frame back
+      }
+      try {
+        const res = await api.runScript({
+          scriptId: chosen.id,
+          scope,
+          frame: app.currentIndex,
+          params: scriptValues(app, chosen),
+        });
+        if (scope === 'all') {
+          app.scriptReport = null;       // the finished job brings the real one
+          app.renderPanel();
+          return;
+        }
+        app.scriptReport = res;
+        if (res.stats) app.state.stats = res.stats;
+        await app.reloadFrame();
+        toast(scriptOutcome(res, 1),
+          res.errors.length ? 'error' : (res.changed ? 'ok' : 'warn'), chosen.name);
+      } catch (err) {
+        toast(err.message, 'error', `Could not run ${chosen.name}`);
+      }
+    };
+
+    body.push(el('button', {
+      class: 'btn block-btn',
+      text: 'Run on this frame',
+      title: chosen.canFrame ? '' : `${chosen.name} only defines apply_all, so it runs across every frame rather than on one.`,
+      disabled: (chosen.canFrame && app.currentIndex !== null) ? null : 'disabled',
+      onclick: () => run('frame'),
+    }));
+    body.push(el('button', {
+      class: 'btn block-btn',
+      text: `Run on all ${frames} frames`,
+      disabled: frames ? null : 'disabled',
+      onclick: () => run('all'),
+    }));
+  }
+
+  const report = app.scriptReport;
+  if (report) {
+    body.push(el('p', { class: 'block-note', text: scriptOutcome(report, frames) }));
+    if (report.backup) {
+      body.push(el('p', { class: 'block-note dim', text: `The session as it was before this run: ${report.backup}` }));
+    }
+    if (report.output && report.output.length) {
+      body.push(el('div', { class: 'joblog', text: report.output.slice(-10).join('\n') }));
+    }
+    const errors = report.errors || [];
+    for (const problem of errors.slice(0, 3)) {
+      body.push(el('div', { class: 'joblog bad',
+        text: (problem.frame === null ? '' : `Frame ${problem.frame}\n`) + problem.error }));
+    }
+    if (errors.length > 3) {
+      body.push(el('p', { class: 'block-note', text: `…and ${errors.length - 3} more frames failed the same way.` }));
+    }
+  }
+
+  for (const bad of broken) {
+    body.push(el('div', { class: 'joblog bad', text: `${bad.id}.py\n${bad.error}` }));
+  }
+
+  body.push(el('div', { class: 'picker-row' }, [
+    el('button', { class: 'ghost', text: 'Reload', title: 'Read the folder again',
+      onclick: () => app.refreshScripts(true) }),
+    el('button', { class: 'ghost', text: 'Open folder',
+      onclick: async () => {
+        try { await api.openScripts(); } catch (err) { toast(err.message, 'error', 'Could not open the folder'); }
+      } }),
+  ]));
+
+  return disclosure(app, {
+    id: 'scripts',
+    title: 'Run a script',
+    summary: chosen ? chosen.name
+      : (list.length ? `${plural(broken.length, 'file')} will not load` : 'none yet'),
+    children: body,
+  });
+}
+
+/** What a run did, in one line. */
+export function scriptOutcome(report, scanned) {
+  const errors = report.errors || [];
+  if (errors.length) {
+    const where = errors[0].frame === null
+      ? 'It stopped before changing anything'
+      : `${plural(errors.length, 'frame')} failed and kept the labels they had`;
+    const rest = report.changed ? ` ${plural(report.changed, 'frame')} changed.` : '';
+    return `${where}.${rest}`;
+  }
+  if (!report.changed) return `Nothing changed on ${plural(report.scanned ?? scanned, 'frame')}.`;
+  const moves = [];
+  if (report.removed) moves.push(`${plural(report.removed, 'box', 'boxes')} removed`);
+  if (report.added) moves.push(`${plural(report.added, 'box', 'boxes')} added`);
+  if (report.dropped) moves.push(`${plural(report.dropped, 'box', 'boxes')} fell outside the picture`);
+  const tail = moves.length ? ` — ${moves.join(', ')}` : '';
+  return `${plural(report.changed, 'frame')} changed${tail}.${report.stopped ? ' Stopped early.' : ''}`;
+}
+
+/** The settings for one script: what it declared, with anything you changed. */
+function scriptValues(app, script) {
+  const stored = (app.ui.scriptParams || {})[script.id] || {};
+  const out = {};
+  for (const spec of script.params) {
+    out[spec.key] = stored[spec.key] === undefined ? spec.default : stored[spec.key];
+  }
+  return out;
+}
+
+function setScriptValue(app, script, key, value) {
+  const all = { ...(app.ui.scriptParams || {}) };
+  all[script.id] = { ...(all[script.id] || {}), [key]: value };
+  app.ui.scriptParams = all;
+}
+
+/** One PARAMS entry, as the control it asked for. */
+function scriptControl(app, script, spec) {
+  const value = scriptValues(app, script)[spec.key];
+  const hint = spec.hint ? el('span', { class: 'block-note dim', text: spec.hint }) : null;
+  const keep = (v) => setScriptValue(app, script, spec.key, v);
+
+  if (spec.type === 'bool') {
+    const input = el('input', { type: 'checkbox', ...(value ? { checked: 'checked' } : {}) });
+    input.addEventListener('change', () => keep(input.checked));
+    return el('div', { class: 'field' }, [el('label', { class: 'inline-field' }, [input, spec.label]), hint]);
+  }
+
+  if (spec.type === 'text') {
+    const input = el('input', { type: 'text', value: String(value ?? ''), placeholder: spec.placeholder || '' });
+    input.addEventListener('input', () => keep(input.value));
+    return field(spec.label, input, spec.hint);
+  }
+
+  if (spec.type === 'choice') {
+    const input = select(spec.options, String(value));
+    input.addEventListener('change', () => keep(input.value));
+    return field(spec.label, input, spec.hint);
+  }
+
+  if (spec.type === 'class') {
+    const input = select(app.state.classes.map((name, i) => [String(i), name]), String(value));
+    input.addEventListener('change', () => keep(+input.value));
+    return field(spec.label, input, spec.hint);
+  }
+
+  // A number with both ends is a slider; one open at either end is a box to type in.
+  if (spec.min === null || spec.max === null) {
+    const input = num(value, { min: spec.min ?? -1e9, max: spec.max ?? 1e9, step: spec.step });
+    input.addEventListener('change', () => keep(+input.value));
+    return field(spec.label, input, spec.hint);
+  }
+
+  const input = el('input', {
+    type: 'range', min: String(spec.min), max: String(spec.max),
+    step: String(spec.step), value: String(value),
+  });
+  const readout = el('span', { class: 'block-note', text: scriptReadout(spec, value) });
+  // As with the augmentation sliders: update the readout, but do not rebuild
+  // the panel mid-drag or the slider goes out from under the pointer.
+  input.addEventListener('input', () => { readout.textContent = scriptReadout(spec, +input.value); });
+  input.addEventListener('change', () => keep(+input.value));
+  return el('label', { class: 'field' }, [el('span', { text: spec.label }), input, readout, hint]);
+}
+
+function scriptReadout(spec, value) {
+  const shown = spec.integer ? String(Math.round(value)) : String(+(+value).toFixed(4));
+  const unit = spec.format ? ` ${spec.format}` : '';
+  const tail = Math.abs(value - spec.default) < 1e-9 ? ' · default' : '';
+  return `${shown}${unit}${tail}`;
 }
 
 // ── 3 · Train ──────────────────────────────────────────────────

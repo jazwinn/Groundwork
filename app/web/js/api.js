@@ -45,6 +45,10 @@ export const api = {
   snap:         (payload)     => request('POST', '/api/autolabel/snap', payload),
   prewarm:      (payload)     => request('POST', '/api/autolabel/prewarm', payload),
 
+  scripts:      ()            => request('GET', '/api/scripts'),
+  runScript:    (payload)     => request('POST', '/api/scripts/run', payload),
+  openScripts:  ()            => request('POST', '/api/scripts/open', {}),
+
   jobs:         ()            => request('GET', '/api/jobs'),
   jobLog:       (id)          => request('GET', `/api/jobs/${id}/log`),
   cancelJob:    (id)          => request('POST', `/api/jobs/${id}/cancel`),

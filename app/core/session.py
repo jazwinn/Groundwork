@@ -19,7 +19,7 @@ import threading
 import time
 from typing import Callable, Iterable
 
-from app.core import boxops, maskops, media_loader
+from app.core import boxops, maskops, media_loader, scripts
 from app.core.jobs import Job, JobManager
 from app.core.sam3_handler import (
     AnnotationStore, BBox, FrameAnnotation, SAM_MODELS,
@@ -32,6 +32,9 @@ SESSION_ROOT = os.path.join(_PROJECT_ROOT, ".groundwork", "session")
 FRAMES_DIR = os.path.join(SESSION_ROOT, "frames")
 THUMBS_DIR = os.path.join(SESSION_ROOT, "thumbs")
 STATE_FILE = os.path.join(SESSION_ROOT, "session.json")
+# Copies of session.json taken before a sweeping change, so one can be undone
+# by putting a file back.  Only the most recent are kept.
+BACKUP_DIR = os.path.join(SESSION_ROOT, "backups")
 
 # Sessions written before the project was renamed live here.  They are moved
 # across on first load rather than read where they lie, so that a session has
@@ -362,6 +365,98 @@ class Session:
         if removed:
             self.save_state()
         return {"frames": changed, "removed": removed, "scanned": len(targets)}
+
+    # ──────────────────────────────────────────────────────────────
+    # Restore points
+    # ──────────────────────────────────────────────────────────────
+
+    def backup_state(self, tag: str = "") -> str:
+        """Copy the saved session aside before something sweeping happens to it.
+
+        Undo only ever covered the frame on screen, so a change that touches
+        every frame needs a way back that is not undo.  Putting one of these
+        files back over session.json is that way.
+        """
+        self.save_state()
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        safe = "".join(c for c in str(tag) if c.isalnum() or c in "-_")[:40] or "backup"
+        path = os.path.join(BACKUP_DIR, f"{time.strftime('%Y%m%d-%H%M%S')}-{safe}.json")
+        shutil.copy2(STATE_FILE, path)
+        self._prune_backups()
+        return path
+
+    @staticmethod
+    def _prune_backups(keep: int = 20) -> None:
+        try:
+            saved = sorted(f for f in os.listdir(BACKUP_DIR) if f.endswith(".json"))
+        except OSError:
+            return
+        for name in (saved[:-keep] if len(saved) > keep else []):
+            try:
+                os.remove(os.path.join(BACKUP_DIR, name))
+            except OSError:
+                pass
+
+    # ──────────────────────────────────────────────────────────────
+    # User scripts
+    # ──────────────────────────────────────────────────────────────
+
+    def script_list(self) -> list[dict]:
+        """Every script in the folder, including any that will not load — a
+        script with a syntax error is worth showing along with its error."""
+        return [info.to_dict() for info in scripts.discover()]
+
+    def run_script(
+        self,
+        script_id: str,
+        frames: Iterable[int] | None = None,
+        params: dict | None = None,
+        *,
+        job: Job | None = None,
+    ) -> dict:
+        """Run a user script over some frames, and keep what it hands back.
+
+        The script works on copies throughout.  Only frames it actually changed
+        are written, and only once the boxes it produced have been checked, so
+        a script that fails partway leaves everything it did not reach alone.
+        """
+        info = scripts.get(script_id)
+        values = scripts.sanitise(info.params, params, len(self.class_names))
+        scope = "frame" if frames is not None else "all"
+
+        wanted = list(frames) if frames is not None else sorted(self.store)
+        views = []
+        for index in wanted:
+            ann = self.store.get(index)
+            if ann is None:
+                continue
+            self._read_size(ann)
+            views.append(scripts.FrameView(ann, self.class_names, self.task))
+
+        report = scripts.run(
+            info, views, values, scope=scope,
+            should_abort=(lambda: job.is_cancelled) if job else None,
+            on_progress=(lambda done, total, msg: job.set_progress(done, total, msg)) if job else None,
+            on_line=job.log if job else None,
+        )
+
+        written = 0
+        for view in views:
+            if not view.changed():
+                continue
+            ann = self.store.get(view.index)
+            if ann is None:
+                continue
+            # The status is carried over rather than set: a script is not a
+            # person looking at the frame and deciding it is right.
+            self.set_boxes(view.index, view.boxes, status=ann.status)
+            written += 1
+        if written:
+            self.save_state()
+
+        result = report.to_dict()
+        result["changed"] = written
+        return result
 
     def delete_frames(self, indices: Iterable[int]) -> int:
         removed = 0

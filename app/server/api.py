@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import subprocess
+import sys
 from typing import Any
 
 from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -20,7 +22,7 @@ from fastapi.staticfiles import StaticFiles
 from app.core.jobs import Job
 from app.core.sam3_handler import BBox, SAM_MODELS
 from app.core.sam2_trainer import SAM2_MODELS, train_sam2
-from app.core import maskops
+from app.core import maskops, scripts
 from app.core.session import MERGE, REPLACE, SKIP, TASKS, Session
 from app.core.yolo_trainer import (
     AUGMENTATIONS, DETECTION_MODELS, POSE_MODELS, RUNS_DIR, SEGMENTATION_MODELS,
@@ -479,6 +481,91 @@ async def clear_labels(payload: dict = Body(...)) -> dict:
     return {"cleared": len(targets), "stats": session.stats()}
 
 
+# Everything that writes boxes to many frames at once — the auto-labellers and a
+# script run — takes its turn through here.  Two of them reading the same frames
+# and then writing them back would quietly lose whichever finished first.
+def _reject_if_busy() -> None:
+    busy = session.jobs.is_busy("autolabel", "track", "prompt", "snap", "script")
+    if busy:
+        raise HTTPException(409, f"{busy.label} is still running — stop it first.")
+
+
+# ---------------------------------------------------------------------------
+# User scripts
+# ---------------------------------------------------------------------------
+
+@app.get("/api/scripts")
+async def list_scripts() -> dict:
+    """What is in the scripts folder right now.
+
+    Off the event loop, because reading the list imports the scripts, and a
+    script is free to do something slow at the top of the file.
+    """
+    listed = await run_in_threadpool(session.script_list)
+    return {"scripts": listed, "dir": scripts.SCRIPTS_DIR}
+
+
+@app.post("/api/scripts/run")
+async def run_script(payload: dict = Body(...)) -> dict:
+    """Run one script on the current frame, or across the whole session."""
+    script_id = str(payload.get("scriptId") or "")
+    params = payload.get("params") or {}
+    try:
+        info = scripts.get(script_id)
+    except scripts.ScriptError as exc:
+        raise HTTPException(400, str(exc))
+
+    if payload.get("scope") == "frame":
+        index = payload.get("frame")
+        if index is None or session.get(int(index)) is None:
+            raise HTTPException(400, "That frame is not loaded.")
+        if not info.per_frame:
+            raise HTTPException(400, f"{info.name} only defines apply_all, so it runs "
+                                     f"across every frame rather than on one.")
+        _reject_if_busy()
+        try:
+            result = await run_in_threadpool(session.run_script, script_id, [int(index)], params)
+        except scripts.ScriptError as exc:
+            raise HTTPException(400, str(exc))
+        result["stats"] = session.stats()
+        return result
+
+    # Across everything: slow enough to want a progress bar and a Stop button,
+    # and sweeping enough to want a way back first.
+    _reject_if_busy()
+    if not session.store:
+        raise HTTPException(400, "There are no frames to run it on.")
+    backup = await run_in_threadpool(session.backup_state, script_id)
+
+    def work(job: Job) -> dict:
+        result = session.run_script(script_id, None, params, job=job)
+        result["backup"] = backup
+        return result
+
+    # A per-frame script can be stopped between frames.  apply_all is one call
+    # into the script and cannot be interrupted, so no Stop button is offered
+    # rather than one that would not do anything.
+    job = session.jobs.start("script", info.name, work, cancellable=not info.across)
+    return {"jobId": job.id, "backup": backup}
+
+
+@app.post("/api/scripts/open")
+async def open_scripts_folder(request: Request) -> dict:
+    """Show the scripts folder in the file manager, for someone at this machine."""
+    if not _local_client(request):
+        raise HTTPException(403, "The scripts folder is on the machine running the server.")
+    os.makedirs(scripts.SCRIPTS_DIR, exist_ok=True)
+    try:
+        if sys.platform == "win32":
+            os.startfile(scripts.SCRIPTS_DIR)          # noqa: S606 — a fixed path
+        else:
+            opener = "open" if sys.platform == "darwin" else "xdg-open"
+            subprocess.Popen([opener, scripts.SCRIPTS_DIR])
+    except OSError as exc:
+        raise HTTPException(500, f"Could not open the folder: {exc}")
+    return {"dir": scripts.SCRIPTS_DIR}
+
+
 # ---------------------------------------------------------------------------
 # Auto-labelling
 # ---------------------------------------------------------------------------
@@ -486,12 +573,6 @@ async def clear_labels(payload: dict = Body(...)) -> dict:
 def _policy(payload: dict) -> str:
     policy = payload.get("policy", REPLACE)
     return policy if policy in (REPLACE, MERGE, SKIP) else REPLACE
-
-
-def _reject_if_busy() -> None:
-    busy = session.jobs.is_busy("autolabel", "track", "prompt", "snap")
-    if busy:
-        raise HTTPException(409, f"{busy.label} is still running — stop it first.")
 
 
 @app.post("/api/autolabel/describe")

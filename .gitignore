@@ -17,6 +17,7 @@ env/
 *.swo
 
 # Application Data / Outputs
+/.groundwork/
 /.modeltrainer/
 /runs/
 /datasets/

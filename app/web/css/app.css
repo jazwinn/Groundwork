@@ -650,6 +650,14 @@ select.mini, input.mini { padding:4px 7px; font-size:12px; width:auto; }
   white-space:pre-wrap;
 }
 
+/* A script that went wrong. Taller than a job log, because a traceback is
+   only useful if you can see which line it points at. */
+.joblog.bad {
+  color:var(--danger);
+  border-color:rgba(226,86,77,.35);
+  max-height:180px;
+}
+
 /* ── Toasts ───────────────────────────────────────────────── */
 
 .toasts {

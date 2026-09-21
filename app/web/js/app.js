@@ -3,7 +3,7 @@
 
 import { api, connect } from './api.js';
 import { Editor } from './canvas.js';
-import { labelPanel, mediaPanel, trainPanel } from './panels.js';
+import { labelPanel, mediaPanel, scriptOutcome, trainPanel } from './panels.js';
 import { confirmDialog, el, nativePicker, openModal, closeModal, plural, toast } from './ui.js';
 
 const UI_DEFAULTS = {
@@ -29,6 +29,10 @@ const UI_DEFAULTS = {
   nativeDialogs: true,
   mergeThreshold: 0.8,
   mergeSameClass: true,
+  script: '',
+  // Per script, and only the settings moved off that script's own
+  // defaults — editing a default in the file is then picked up.
+  scriptParams: {},
   // Only the settings moved off their default live here; the rest come from
   // the server's spec, so a change to a default is picked up rather than
   // frozen into everyone's browser.
@@ -37,7 +41,7 @@ const UI_DEFAULTS = {
 };
 
 const app = {
-  state: { classes: ['object'], task: 'detect', samModel: '', samModels: [], threshold: 0.5, frames: [], stats: {}, device: {}, augmentations: [] },
+  state: { classes: ['object'], task: 'detect', samModel: '', samModels: [], threshold: 0.5, frames: [], stats: {}, device: {}, augmentations: [], scripts: [] },
   models: null,
   ui: loadUi(),
   step: 'media',
@@ -51,6 +55,11 @@ const app = {
   jobLogs: new Map(),
   editor: null,
   suppressReload: 0,
+  // The scripts folder is read on demand rather than with the rest of the
+  // state: it imports every script, and a script is free to be slow.
+  scriptsState: 'idle',   // 'idle' | 'loading' | 'ready' | 'error'
+  scriptsDir: '',
+  scriptReport: null,
 };
 
 const UI_KEY = 'groundwork.ui';
@@ -145,6 +154,28 @@ app.setSearchClass = (id) => {
 };
 
 app.reloadFrame = () => reloadCurrentFrame();
+
+/** Read the scripts folder. Cheap after the first time, so panels may ask freely. */
+app.refreshScripts = async (force = false) => {
+  if (app.scriptsState === 'loading') return;
+  if (app.scriptsState === 'ready' && !force) return;
+  app.scriptsState = 'loading';
+  try {
+    const res = await api.scripts();
+    app.state.scripts = res.scripts || [];
+    app.scriptsDir = res.dir || '';
+    app.scriptsState = 'ready';
+  } catch {
+    app.scriptsState = 'error';
+  }
+  app.renderPanel();
+};
+
+/** Settle the frame before something else edits it, and leave a way back. */
+app.beforeFrameEdit = async () => {
+  if (app.editor) app.editor.pushUndo();
+  await flushSave();
+};
 
 app.onTaskChange = () => {
   syncMaskTools();
@@ -634,7 +665,7 @@ function renderJobs() {
     ]);
 
     const lines = app.jobLogs.get(job.id);
-    if (lines && lines.length && (job.kind === 'train' || job.kind === 'convert')) {
+    if (lines && lines.length && (job.kind === 'train' || job.kind === 'convert' || job.kind === 'script')) {
       const log = el('div', { class: 'joblog', text: lines.slice(-8).join('\n') });
       node.appendChild(log);
     }
@@ -672,6 +703,10 @@ function onJobFinished(job) {
       ? `Outline added — ${plural(r.points || 0, 'point')}.`
       : 'Nothing to outline there. Draw the box a little tighter around the object.',
       r.objects ? 'ok' : 'warn', 'Snap');
+  } else if (job.kind === 'script') {
+    app.scriptReport = r;
+    toast(scriptOutcome(r, app.state.frames.length),
+      (r.errors || []).length ? 'error' : (r.changed ? 'ok' : 'warn'), job.label);
   } else if (job.kind === 'train') {
     const where = r.best || r.save_dir || '';
     toast(where ? `Weights saved to ${where}` : 'Training finished.', 'ok', 'Training complete');
@@ -695,7 +730,7 @@ function handleEvent(msg) {
       if (msg.event === 'finished') {
         onJobFinished(job);
         setTimeout(() => { app.jobs.delete(job.id); app.jobLogs.delete(job.id); renderJobs(); }, 600);
-        if (['autolabel', 'track', 'prompt', 'snap'].includes(job.kind)) {
+        if (['autolabel', 'track', 'prompt', 'snap', 'script'].includes(job.kind)) {
           reloadCurrentFrame();
           refreshStats();
         }
