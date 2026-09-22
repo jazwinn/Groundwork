@@ -24,8 +24,9 @@ from app.core import boxops, maskops, media_loader, scripts
 from app.core.jobs import Job, JobManager
 from app.core.sam3_handler import (
     AnnotationStore, BBox, FrameAnnotation, SAM_MODELS,
-    FrameEncodingCache, encode_frame, load_sam3, load_sam3_tracker,
-    run_concepts_over_frames, run_sam3, segment_box, track_through_frames,
+    EXEMPLAR_THRESHOLD, FrameEncodingCache, encode_exemplar_prompt, encode_frame,
+    load_sam3, load_sam3_tracker, run_concepts_over_frames, run_exemplar_over_frames,
+    run_sam3, segment_box, track_through_frames,
 )
 from app.core.yolo_trainer import _PROJECT_ROOT
 
@@ -997,6 +998,86 @@ class Session:
             return {"objects": len(boxes), "frame": frame_index}
 
         return self.jobs.start("prompt", f"Finding matches on frame {frame_index}", work)
+
+    def start_exemplar_search(
+        self,
+        seed_index: int,
+        pos: list[list[float]],
+        neg: list[list[float]],
+        frames: list[tuple[int, str]],
+        *,
+        text: str | None = None,
+        class_id: int = 0,
+        policy: str = REPLACE,
+        threshold: float | None = None,
+        label: str = "Finding matches",
+    ) -> Job:
+        """Take the example drawn on one frame and look for it on the others.
+
+        The example itself cannot travel — SAM 3 reads a box against the picture
+        it was drawn on — so what travels is the concept the model builds from
+        it.  `encode_exemplar_prompt` does that once here, and checks itself
+        against the model's own prompt before any of it is trusted.
+        """
+        seed = self.store.get(seed_index)
+        if seed is None:
+            raise ValueError(f"Frame {seed_index} is not loaded.")
+        if not pos:
+            raise ValueError(
+                "Draw at least one green example box around something you want.")
+        threshold = EXEMPLAR_THRESHOLD if threshold is None else threshold
+
+        # Same pre-filter as a concept search: apply_auto_boxes turns away a
+        # held-out frame whatever arrives for it, so running the model over one
+        # only spends the time to throw the answer away.
+        frames = [(i, p) for i, p in frames
+                  if not (i in self.store and self.store[i].held_out)]
+        if policy == SKIP:
+            frames = [(i, p) for i, p in frames
+                      if i in self.store and not self.store[i].boxes]
+
+        def work(job: Job) -> dict:
+            from PIL import Image
+
+            model, processor = self.ensure_sam(job)
+            job.raise_if_cancelled()
+
+            job.set_message("Learning the example…")
+            seed_img = Image.open(seed.image_path).convert("RGB")
+            prompt = encode_exemplar_prompt(
+                model, processor, seed_img,
+                pos_boxes=[tuple(b) for b in pos],
+                neg_boxes=[tuple(b) for b in neg],
+                text=text, seed_index=seed_index,
+            )
+            job.raise_if_cancelled()
+
+            hits = {"boxes": 0, "frames": 0}
+
+            def on_boxes(index: int, boxes: list[BBox]) -> None:
+                if boxes:
+                    hits["boxes"] += len(boxes)
+                    hits["frames"] += 1
+                # The seed carries boxes drawn by hand.  Whatever the sweep is
+                # running under, those are not for it to throw away.
+                self.apply_auto_boxes(
+                    index, boxes, MERGE if index == seed_index else policy)
+
+            run_exemplar_over_frames(
+                model, processor, frames, prompt,
+                class_id=class_id, threshold=threshold,
+                want_masks=self.wants_masks, detail=self.mask_detail,
+                on_boxes=on_boxes,
+                on_progress=lambda cur, tot: job.set_progress(
+                    cur, tot, f"{cur} / {tot} frames · {hits['boxes']} objects found"
+                ),
+                should_abort=lambda: job.is_cancelled,
+                on_error=job.log,
+            )
+            self.save_state()
+            return {"objects": hits["boxes"], "framesWithObjects": hits["frames"]}
+
+        return self.jobs.start("autolabel", label, work)
 
     @staticmethod
     def _frame_key(image_path: str) -> tuple:

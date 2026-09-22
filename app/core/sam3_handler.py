@@ -356,6 +356,280 @@ def _results_to_boxes(
 
 
 # ---------------------------------------------------------------------------
+# Carrying one frame's example to the others
+# ---------------------------------------------------------------------------
+#
+# SAM 3 ties an example box to the picture it was drawn on: `Sam3Model.forward`
+# hands `input_boxes` to `geometry_encoder(..., img_feats=<this image's FPN>)`,
+# so the same coordinates on another frame pool whatever happens to lie there.
+# Re-prompting frame by frame that way scored 0.67 recall against 0.83 for what
+# is done here, which is the measurement that says this is worth the trouble.
+#
+# What can travel is the prompt the geometry encoder builds.  `forward` reads
+# only `text_embeds.pooler_output`, and with `input_boxes=None` it passes that
+# straight through as the whole prompt.  So a pre-built [text ; geometry]
+# sequence handed in as `text_embeds` reaches the detector exactly as the
+# model's own would — checked numerically on every run rather than assumed.
+
+# Versions this was written against.  Advisory: a mismatch is worth saying out
+# loud, but the checks below decide, not the number.
+EXEMPLAR_TESTED_TRANSFORMERS = ("5.10.2",)
+
+# Examples want a higher bar than phrases do.  Swept over held-out and verified
+# frames: a whole-module example peaked at 0.50–0.65 (F1 0.70), while the 0.35
+# that suits a text phrase returned about 420 boxes for 171 objects.
+EXEMPLAR_THRESHOLD = 0.5
+
+
+class ExemplarUnsupported(RuntimeError):
+    """This transformers build does not expose what carrying an example needs."""
+
+
+@dataclass
+class ExemplarPrompt:
+    """A concept learned from example boxes on one frame, reusable on others.
+
+    `features` is the whole prompt the detector consumes: the text half (the
+    "visual" sentinel, or a phrase that was typed alongside) followed by one
+    token per example box and the geometry encoder's summary token.  Those box
+    tokens carry what the example *looked like*; the coordinates stay behind.
+    """
+    features: object                  # [1, 32 + boxes + 1, 256], model dtype/device
+    mask: object                      # [1, 32 + boxes + 1] bool
+    seed_index: int | None = None
+    num_boxes: int = 0
+    text: str = "visual"
+    drift: dict = field(default_factory=dict)
+
+
+def check_exemplar_support() -> None:
+    """Refuse before anything loads if the pieces this leans on have moved.
+
+    Cheap enough to call on every request: it reads signatures, not weights.
+    """
+    import inspect
+
+    import transformers
+    from transformers.models.sam3 import modeling_sam3 as M
+
+    wanted = (
+        ("Sam3Model.forward", M.Sam3Model.forward,
+         ("pixel_values", "vision_embeds", "input_ids", "attention_mask",
+          "text_embeds", "input_boxes", "input_boxes_labels")),
+        ("Sam3Model.get_vision_features", M.Sam3Model.get_vision_features,
+         ("pixel_values",)),
+        ("Sam3Model.get_text_features", M.Sam3Model.get_text_features,
+         ("input_ids",)),
+        ("Sam3GeometryEncoder.forward", M.Sam3GeometryEncoder.forward,
+         ("box_embeddings", "box_mask", "box_labels", "img_feats", "img_pos_embeds")),
+    )
+    for label, fn, params in wanted:
+        have = set(inspect.signature(fn).parameters)
+        missing = [p for p in params if p not in have]
+        if missing:
+            raise ExemplarUnsupported(
+                f"transformers {transformers.__version__}: {label} no longer takes "
+                f"{', '.join(missing)}, so an example cannot be carried to other "
+                f"frames. Everything else is unaffected. Written against "
+                f"{', '.join(EXEMPLAR_TESTED_TRANSFORMERS)}.")
+
+    for name, fields_ in (("Sam3VisionEncoderOutput",
+                           ("fpn_hidden_states", "fpn_position_encoding")),
+                          ("Sam3GeometryEncoderOutput",
+                           ("last_hidden_state", "attention_mask"))):
+        cls = getattr(M, name, None)
+        if cls is None:
+            raise ExemplarUnsupported(
+                f"transformers {transformers.__version__}: {name} is gone, so an "
+                f"example cannot be carried to other frames.")
+        missing = [f for f in fields_ if f not in getattr(cls, "__annotations__", {})]
+        if missing:
+            raise ExemplarUnsupported(
+                f"transformers {transformers.__version__}: {name} no longer carries "
+                f"{', '.join(missing)}, so an example cannot be carried to other frames.")
+
+
+def _as_text_embeds(features):
+    """Present a prompt sequence as pre-computed text.
+
+    `forward` only ever reads `.pooler_output`, so the detector cannot tell a
+    hand-built prompt from one it made itself.
+    """
+    from transformers.modeling_outputs import BaseModelOutputWithPooling
+    return BaseModelOutputWithPooling(last_hidden_state=features, pooler_output=features)
+
+
+def _exemplar_proc_kwargs(pil_img, text, pos_boxes, neg_boxes):
+    """The same kwargs `run_sam3` builds — the processor does the normalising."""
+    kwargs: dict = dict(images=pil_img, return_tensors="pt")
+    if text:
+        kwargs["text"] = text
+    boxes_xyxy: list[list[float]] = []
+    labels: list[int] = []
+    for b in (pos_boxes or []):
+        boxes_xyxy.append([float(b[0]), float(b[1]), float(b[2]), float(b[3])])
+        labels.append(1)
+    for b in (neg_boxes or []):
+        boxes_xyxy.append([float(b[0]), float(b[1]), float(b[2]), float(b[3])])
+        labels.append(0)
+    if boxes_xyxy:
+        kwargs["input_boxes"] = [boxes_xyxy]
+        kwargs["input_boxes_labels"] = [labels]
+    return kwargs
+
+
+def encode_exemplar_prompt(
+    model,
+    processor,
+    pil_img: Image.Image,
+    *,
+    pos_boxes: list[tuple[float, float, float, float]],
+    neg_boxes: list[tuple[float, float, float, float]] | None = None,
+    text: str | None = None,
+    seed_index: int | None = None,
+    verify: bool = True,
+) -> ExemplarPrompt:
+    """Learn a concept from example boxes on one frame.
+
+    Leaving *text* as None lets the processor insert the "visual" sentinel — the
+    token the model was trained with to mean "the concept is the example, not a
+    word".  A phrase given as well narrows the search rather than replacing it.
+    """
+    import torch
+
+    if not pos_boxes:
+        raise ValueError(
+            "Draw at least one green example box around something you want.")
+
+    inputs = _to_device(
+        processor(**_exemplar_proc_kwargs(pil_img, text, pos_boxes, neg_boxes)), model)
+
+    # no_grad rather than inference_mode: this prompt is kept and reused on every
+    # later frame, and inference tensors carry lifetime rules that bite there.
+    with torch.no_grad():
+        vision_out = model.get_vision_features(pixel_values=inputs["pixel_values"])
+        # forward drops the coarsest FPN level before the geometry encoder sees
+        # it, so dropping it here is what keeps the two paths comparable.
+        fpn_feats = tuple(vision_out.fpn_hidden_states)[:-1]
+        fpn_pos = tuple(vision_out.fpn_position_encoding)[:-1]
+
+        text_features = model.get_text_features(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            return_dict=True,
+        ).pooler_output
+        text_mask = inputs["attention_mask"].bool()
+
+        pad = getattr(processor, "point_pad_value", -10)
+        labels = inputs["input_boxes_labels"]
+        geometry = model.geometry_encoder(
+            box_embeddings=inputs["input_boxes"],
+            box_mask=(labels != pad),
+            box_labels=torch.where(labels == pad, torch.zeros_like(labels), labels),
+            img_feats=fpn_feats,
+            img_pos_embeds=fpn_pos,
+        )
+
+        # Cloned so the prompt outlives the frame's features, which are large.
+        features = torch.cat([text_features, geometry.last_hidden_state], dim=1).clone()
+        mask = torch.cat([text_mask, geometry.attention_mask.bool()], dim=1).clone()
+
+    prompt = ExemplarPrompt(
+        features=features, mask=mask, seed_index=seed_index,
+        num_boxes=len(pos_boxes) + len(neg_boxes or []),
+        text=text or "visual",
+    )
+    if verify:
+        prompt.drift = _verify_prompt_transfer(model, vision_out, inputs, features, mask)
+
+    del vision_out, fpn_feats, fpn_pos
+    return prompt
+
+
+def _verify_prompt_transfer(model, vision_out, inputs, features, mask) -> dict:
+    """Check the hand-built prompt against the one the model builds itself.
+
+    A rename is caught by `check_exemplar_support`.  The dangerous change is a
+    quiet one — the halves concatenated the other way round, a different FPN
+    level — because that yields boxes that look plausible and are wrong.  Both
+    calls here reuse the frame's vision features, so this costs two detector
+    passes and no image encoding, which is cheap enough to do every time.
+    """
+    import torch
+
+    try:
+        with torch.no_grad():
+            theirs = model(vision_embeds=vision_out,
+                           input_ids=inputs["input_ids"],
+                           attention_mask=inputs["attention_mask"],
+                           input_boxes=inputs["input_boxes"],
+                           input_boxes_labels=inputs["input_boxes_labels"])
+            ours = model(vision_embeds=vision_out,
+                         text_embeds=_as_text_embeds(features),
+                         attention_mask=mask)
+        d_scores = (theirs.pred_logits.sigmoid()
+                    - ours.pred_logits.sigmoid()).abs().max().item()
+        d_boxes = (theirs.pred_boxes - ours.pred_boxes).abs().max().item()
+    except (AttributeError, TypeError, RuntimeError) as exc:
+        import transformers
+        raise ExemplarUnsupported(
+            f"This transformers ({transformers.__version__}) builds example prompts "
+            f"differently from the version this was written against, so matches on "
+            f"other frames would be wrong rather than merely worse. Carrying an "
+            f"example to other frames is unavailable; describing what to find, and "
+            f"examples on a single frame, still work. "
+            f"({type(exc).__name__}: {exc})") from None
+
+    if d_scores > 0.02 or d_boxes > 0.01:
+        import transformers
+        raise ExemplarUnsupported(
+            f"This transformers ({transformers.__version__}) builds example prompts "
+            f"differently (scores differ by {d_scores:.4f}, boxes by {d_boxes:.4f}), "
+            f"so matches on other frames would be wrong rather than merely worse. "
+            f"Carrying an example to other frames is unavailable; describing what to "
+            f"find, and examples on a single frame, still work.")
+    return {"scores": d_scores, "boxes": d_boxes}
+
+
+def detect_with_exemplar(
+    model,
+    processor,
+    pil_img: Image.Image,
+    prompt: ExemplarPrompt,
+    *,
+    class_id: int = 0,
+    threshold: float = EXEMPLAR_THRESHOLD,
+    want_masks: bool = False,
+    detail: str = maskops.DEFAULT_DETAIL,
+) -> list[BBox]:
+    """Find things like the example on a frame it was not drawn on."""
+    import torch
+
+    W, H = pil_img.size
+    inputs = _to_device(processor(images=pil_img, return_tensors="pt"), model)
+
+    with torch.inference_mode():
+        outputs = model(
+            pixel_values=inputs["pixel_values"],
+            text_embeds=_as_text_embeds(prompt.features),
+            attention_mask=prompt.mask,
+        )
+
+    target_sizes = inputs.get("original_sizes")
+    if hasattr(target_sizes, "tolist"):
+        target_sizes = target_sizes.tolist()
+    if not target_sizes:
+        target_sizes = [[H, W]]
+
+    results = processor.post_process_instance_segmentation(
+        outputs, threshold=threshold, mask_threshold=0.5, target_sizes=target_sizes,
+    )[0]
+
+    return _results_to_boxes(results, W, H, class_id,
+                             want_masks=want_masks, detail=detail)
+
+
+# ---------------------------------------------------------------------------
 # Bulk operations (driven by callbacks — no threading here)
 # ---------------------------------------------------------------------------
 
@@ -404,6 +678,49 @@ def run_concepts_over_frames(
                     want_masks=want_masks, detail=detail,
                 ))
             on_boxes(frame_index, boxes)
+        except Exception as exc:
+            if on_error:
+                on_error(f"Frame {frame_index}: {exc}")
+        processed += 1
+        if on_progress:
+            on_progress(processed, total)
+    return processed
+
+
+def run_exemplar_over_frames(
+    model,
+    processor,
+    frames: list[tuple[int, str]],
+    prompt: ExemplarPrompt,
+    *,
+    class_id: int = 0,
+    threshold: float = EXEMPLAR_THRESHOLD,
+    want_masks: bool = False,
+    detail: str = maskops.DEFAULT_DETAIL,
+    on_boxes: Callable[[int, list[BBox]], None],
+    on_progress: Callable[[int, int], None] | None = None,
+    should_abort: Callable[[], bool] | None = None,
+    on_error: Callable[[str], None] | None = None,
+) -> int:
+    """Carry one frame's example across many frames.
+
+    The twin of `run_concepts_over_frames`, and deliberately the same shape,
+    down to a bad frame costing only that frame.  There is no inner loop here:
+    however many boxes were drawn, they are one concept and one pass.
+    """
+    total = len(frames)
+    processed = 0
+
+    for frame_index, png_path in frames:
+        if should_abort and should_abort():
+            break
+        try:
+            pil_img = Image.open(png_path).convert("RGB")
+            on_boxes(frame_index, detect_with_exemplar(
+                model, processor, pil_img, prompt,
+                class_id=class_id, threshold=threshold,
+                want_masks=want_masks, detail=detail,
+            ))
         except Exception as exc:
             if on_error:
                 on_error(f"Frame {frame_index}: {exc}")

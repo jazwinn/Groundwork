@@ -42,6 +42,7 @@ export const api = {
   propagate:    (payload)     => request('POST', '/api/autolabel/propagate', payload),
   track:        (payload)     => request('POST', '/api/autolabel/track', payload),
   prompt:       (payload)     => request('POST', '/api/autolabel/prompt', payload),
+  exemplar:     (payload)     => request('POST', '/api/autolabel/exemplar', payload),
   snap:         (payload)     => request('POST', '/api/autolabel/snap', payload),
   prewarm:      (payload)     => request('POST', '/api/autolabel/prewarm', payload),
 

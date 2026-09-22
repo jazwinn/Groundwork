@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app.core.jobs import Job
-from app.core.sam3_handler import BBox, SAM_MODELS
+from app.core.sam3_handler import BBox, ExemplarUnsupported, SAM_MODELS, check_exemplar_support
 from app.core.sam2_trainer import SAM2_MODELS, train_sam2
 from app.core import maskops, overlay, scripts
 from app.core.session import MERGE, REPLACE, SKIP, TASKS, Session
@@ -727,6 +727,49 @@ async def autolabel_prompt(payload: dict = Body(...)) -> dict:
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     return {"job": job.to_dict()}
+
+
+@app.post("/api/autolabel/exemplar")
+async def autolabel_exemplar(payload: dict = Body(...)) -> dict:
+    """The same example, looked for across a range of frames rather than one."""
+    _reject_if_busy()
+    try:
+        # Reads signatures, not weights, so an unusable build says so here
+        # rather than after the model has finished loading.
+        check_exemplar_support()
+    except ExemplarUnsupported as exc:
+        raise HTTPException(400, str(exc))
+
+    seed_index = int(payload.get("frame", -1))
+    seed = session.get(seed_index)
+    if seed is None:
+        raise HTTPException(404, "Frame not found")
+
+    frames = session.frames_for_range(
+        start=int(payload.get("start", 0)),
+        stride=int(payload.get("stride", 1)),
+        exclude=seed_index,
+    )
+    # The seed goes first: its own matches are the fastest way to see whether
+    # the example was a good one.
+    frames = [(seed_index, seed.image_path), *frames]
+
+    try:
+        job = session.start_exemplar_search(
+            seed_index,
+            payload.get("positive") or [],
+            payload.get("negative") or [],
+            frames,
+            text=(payload.get("text") or "").strip() or None,
+            class_id=int(payload.get("classId", 0)),
+            policy=_policy(payload),
+            threshold=payload.get("threshold"),
+            label=f"Finding matches for the example on frame {seed_index} "
+                  f"in {len(frames)} frames",
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    return {"job": job.to_dict(), "frames": len(frames)}
 
 
 # ---------------------------------------------------------------------------

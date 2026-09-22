@@ -256,7 +256,7 @@ const METHODS = [
   {
     id: 'example',
     title: 'Point at an example',
-    sub: 'Box one object on this frame; SAM 3 finds the others like it here.',
+    sub: 'Box one object; SAM 3 finds the others like it — on this frame, or across them all.',
     when: 'Best when the object is hard to name, or a description brings back the wrong things.',
   },
   {
@@ -546,7 +546,7 @@ function methodBody(app, method, { frame, detail, boxCount }) {
     text.addEventListener('input', () => { ui.promptText = text.value; });
 
     const run = el('button', {
-      class: 'btn primary block-btn',
+      class: 'btn block-btn',
       text: 'Find matches on this frame',
       disabled: (!app.examples.positive.length && !(ui.promptText || '').trim()) || !frame ? 'disabled' : null,
     });
@@ -563,18 +563,55 @@ function methodBody(app, method, { frame, detail, boxCount }) {
       } catch (err) { toast(err.message, 'error', 'Could not start'); }
     };
 
-    body.append(
+    const start = num(ui.start, { min: 0 });
+    const every = num(ui.stride, { min: 1, max: 120 });
+    const count = () => countFrames(app, +start.value, +every.value);
+
+    const runAll = el('button', {
+      class: 'btn primary block-btn',
+      text: `Find matches in ${count()} frames`,
+      disabled: (!app.examples.positive.length || !frame) ? 'disabled' : null,
+    });
+    const refresh = () => { runAll.textContent = `Find matches in ${count()} frames`; };
+    start.addEventListener('input', refresh);
+    every.addEventListener('input', refresh);
+    runAll.onclick = async () => {
+      ui.start = +start.value;
+      ui.stride = +every.value;
+      try {
+        await api.exemplar({
+          frame: app.currentIndex,
+          positive: app.examples.positive,
+          negative: app.examples.negative,
+          text: text.value.trim(),
+          classId: ui.classId,
+          start: +start.value,
+          stride: +every.value,
+          policy: ui.policy,
+        });
+      } catch (err) { toast(err.message, 'error', 'Could not start'); }
+    };
+
+    // append(), not body.append(): the warning is usually absent, and
+    // body.append would put the word "null" on the page.
+    append(body, [
       el('ol', { class: 'steplist' }, [
-        el('li', {}, [el('b', { text: 'Example' }), ' in the toolbar, then drag a box around one object you want.']),
+        el('li', {}, [el('b', { text: 'Example' }), ' in the toolbar, then drag a box around one ', el('b', { text: 'whole' }), ' object you want.']),
         el('li', {}, [el('b', { text: 'Exclude' }), ' and drag around anything it should not match (optional).']),
-        el('li', {}, ['Run it. Matches land on this frame as ', el('b', { text: 'new boxes' }), '.']),
+        el('li', {}, ['Run it on this frame, or across every frame.']),
       ]),
       tally,
+      partialExampleNote(app, detail),
       field('Describe it too', text, 'A word or two sharpens the search when examples alone are ambiguous.'),
       run,
+      el('div', { class: 'field-row' }, [
+        field('From frame', start),
+        field('Every Nth', every),
+      ]),
+      runAll,
       el('button', { class: 'btn block-btn', text: 'Clear examples', onclick: () => app.clearExamples() }),
-      el('p', { class: 'block-note', text: 'This works on the frame you are looking at. To spread labels, use one of the other methods afterwards.' }),
-    );
+      el('p', { class: 'block-note', text: 'Across frames, the example itself stays put — what travels is the concept SAM 3 builds from it.' }),
+    ]);
   }
 
   if (method.id === 'reuse') {
@@ -652,6 +689,30 @@ function methodBody(app, method, { frame, detail, boxCount }) {
 function countFrames(app, start, stride) {
   const step = Math.max(1, stride || 1);
   return app.state.frames.filter((f) => f.index >= (start || 0) && f.index % step === 0).length;
+}
+
+/** Warn when the example looks like a piece of an object rather than one.
+ *
+ * Which box you draw decides more than anything else here. Measured against
+ * held-out and verified frames, examples about as wide as the objects scored
+ * F1 0.63–0.70, while fragments a fifth to a half as wide scored 0.52–0.57 —
+ * worse than searching by description. The other boxes already on the frame
+ * are the only yardstick available, so say nothing until there are a few.
+ */
+function partialExampleNote(app, detail) {
+  const drawn = app.examples.positive;
+  const others = (detail?.boxes || []).map((b) => b.x2 - b.x1).sort((a, b) => a - b);
+  if (!drawn.length || others.length < 3) return null;
+
+  const widths = drawn.map((b) => b[2] - b[0]).sort((a, b) => a - b);
+  const mine = widths[Math.floor(widths.length / 2)];
+  const theirs = others[Math.floor(others.length / 2)];
+  if (!theirs || mine >= theirs * 0.6) return null;
+
+  return el('p', { class: 'block-note warn' }, [
+    `That example is about ${Math.round((100 * mine) / theirs)}% as wide as the other objects on this frame. `,
+    'A part of an object finds less than a whole one — draw around the whole thing if you can.',
+  ]);
 }
 
 function editClasses(app) {
