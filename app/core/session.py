@@ -122,7 +122,7 @@ class Session:
     def __init__(self, emit: Callable[[dict], None] | None = None):
         self.store: AnnotationStore = {}
         self.class_names: list[str] = ["object"]
-        self.task: str = "detect"
+        self.task: str = "segment"
         self.sam_model_key: str = next(iter(SAM_MODELS))
         self.threshold: float = 0.5
         self.mask_detail: str = maskops.DEFAULT_DETAIL
@@ -284,7 +284,7 @@ class Session:
 
         with self._lock:
             self.class_names = data.get("class_names") or ["object"]
-            self.task = data.get("task", "detect")
+            self.task = data.get("task", "segment")
             self.sam_model_key = data.get("sam_model_key", self.sam_model_key)
             self.threshold = float(data.get("threshold", 0.5))
             self.mask_detail = data.get("mask_detail", maskops.DEFAULT_DETAIL)

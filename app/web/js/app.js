@@ -45,7 +45,7 @@ const UI_KEY = 'groundwork.ui';
 const UI_KEY_LEGACY = 'modeltrainer.ui';   // what it was called before the rename
 
 const app = {
-  state: { classes: ['object'], task: 'detect', samModel: '', samModels: [], threshold: 0.5, frames: [], stats: {}, device: {}, augmentations: [], scripts: [] },
+  state: { classes: ['object'], task: 'segment', samModel: '', samModels: [], threshold: 0.5, frames: [], stats: {}, device: {}, augmentations: [], scripts: [] },
   models: null,
   ui: loadUi(),
   step: 'media',

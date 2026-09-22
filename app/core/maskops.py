@@ -22,7 +22,7 @@ DETAIL_LEVELS = {
     "medium": 0.004,
     "fine": 0.0012,
 }
-DEFAULT_DETAIL = "medium"
+DEFAULT_DETAIL = "coarse"
 
 # A YOLO seg label needs at least a triangle.
 MIN_POINTS = 3

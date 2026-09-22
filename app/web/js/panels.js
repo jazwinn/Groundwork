@@ -303,7 +303,7 @@ export function labelPanel(app) {
       medium: 'Medium — follows most shapes',
       fine: 'Fine — keeps every wobble',
     }[d] || d]),
-    app.state.maskDetail || 'medium',
+    app.state.maskDetail || 'coarse',
   );
   detailSelect.addEventListener('change', () => api.settings({ maskDetail: detailSelect.value }));
 
