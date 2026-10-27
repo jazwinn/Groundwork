@@ -29,6 +29,35 @@ pip install -r requirements.txt
 python -m app.main
 ```
 
+### Setting up SAM 3
+
+The auto-labeller runs on `facebook/sam3`, which is gated on Hugging Face: the app
+downloads it the first time it is used (about 3.5 GB), but only for an account that has
+been granted access. Do this once per machine:
+
+1. **Make an account** at [huggingface.co](https://huggingface.co).
+2. **Request access** at [huggingface.co/facebook/sam3](https://huggingface.co/facebook/sam3)
+   by filling in the licence form at the top of the page. Meta approves it, usually within
+   minutes to hours, and the page says when you are in.
+3. **Make a token** at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens)
+   → *Create new token*. A *Read* token is enough; it starts with `hf_`.
+4. **Log in** with the venv active, pasting the token when asked (answer *no* to adding it
+   as a git credential):
+
+   ```bash
+   hf auth login
+   ```
+
+   `hf auth whoami` should then print your username. If `hf` is not found, run
+   `pip install -U huggingface_hub`.
+
+5. **Start the app and run SAM 3 once.** The weights are downloaded into the Hugging Face
+   cache (`%USERPROFILE%\.cache\huggingface\hub\models--facebook--sam3`) and used from there
+   afterwards, offline.
+
+**No Hugging Face access?** Copy the `models--facebook--sam3` folder from that cache on a
+machine that already has it into the same place on the new one. Nothing else is needed.
+
 The server starts and opens `http://localhost:8321` in your browser. Useful flags:
 
 | Flag | What it does |
@@ -325,6 +354,10 @@ work but are much slower. Install the CUDA build of PyTorch.
 
 **The first SAM 3 run takes a minute.** The model is downloaded once and then loaded into
 VRAM; later runs in the same session reuse it.
+
+**SAM 3 fails with a 401 or 403, or "gated repo".** The machine is not logged in to
+Hugging Face, or the account has not been granted access yet — see
+[Setting up SAM 3](#setting-up-sam-3).
 
 **Tracking loses objects.** The tracker follows objects between neighbouring frames. If
 the video was imported keeping 1 frame in 5, objects jump too far between frames — the
